@@ -53,6 +53,12 @@ final class ModelDownloader: NSObject {
         localModelURL(for: model) != nil
     }
 
+    /// Check if any files exist (including partial downloads).
+    func hasFiles(_ model: ModelInfo) -> Bool {
+        let dir = modelsDirectory.appendingPathComponent(model.folderName)
+        return fileManager.fileExists(atPath: dir.path)
+    }
+
     func localModelURL(for model: ModelInfo) -> URL? {
         let dir = modelsDirectory.appendingPathComponent(model.folderName)
         // Check pre-compiled .mlmodelc first

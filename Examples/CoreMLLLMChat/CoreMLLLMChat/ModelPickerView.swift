@@ -12,6 +12,7 @@ struct ModelPickerView: View {
                         ModelRow(
                             model: model,
                             isDownloaded: downloader.isDownloaded(model),
+                            hasFiles: downloader.hasFiles(model),
                             isDownloading: downloader.isDownloading,
                             progress: downloader.progress,
                             onDownload: { downloadAndLoad(model) },
@@ -60,6 +61,7 @@ struct ModelPickerView: View {
 struct ModelRow: View {
     let model: ModelDownloader.ModelInfo
     let isDownloaded: Bool
+    let hasFiles: Bool
     let isDownloading: Bool
     let progress: Double
     let onDownload: () -> Void
@@ -71,9 +73,15 @@ struct ModelRow: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(model.name)
                     .font(.headline)
-                Text(model.size)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    Text(model.size)
+                    if hasFiles && !isDownloaded {
+                        Text("(incomplete)")
+                            .foregroundStyle(.orange)
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
 
             Spacer()
@@ -89,10 +97,18 @@ struct ModelRow: View {
                     .controlSize(.small)
                 }
             } else {
-                Button("Download") { onDownload() }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(isDownloading)
+                HStack(spacing: 8) {
+                    Button("Download") { onDownload() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(isDownloading)
+                    if hasFiles {
+                        Button(role: .destructive) { onDelete() } label: {
+                            Image(systemName: "trash")
+                        }
+                        .controlSize(.small)
+                    }
+                }
             }
         }
         .padding(.vertical, 4)
