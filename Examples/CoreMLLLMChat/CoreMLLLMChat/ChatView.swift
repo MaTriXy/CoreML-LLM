@@ -5,7 +5,6 @@ struct ChatView: View {
     @State private var messages: [ChatMessage] = []
     @State private var inputText = ""
     @State private var showModelPicker = false
-    @State private var modelURL: URL?
     @State private var streamingText = ""
 
     var body: some View {
@@ -60,7 +59,7 @@ struct ChatView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button("Load Model") {
+                    Button(runner.isLoaded ? "Switch Model" : "Get Model") {
                         showModelPicker = true
                     }
                     .disabled(runner.isGenerating)
@@ -74,13 +73,10 @@ struct ChatView: View {
                     .disabled(runner.isGenerating)
                 }
             }
-            .fileImporter(
-                isPresented: $showModelPicker,
-                allowedContentTypes: [.folder],
-                allowsMultipleSelection: false
-            ) { result in
-                if case .success(let urls) = result, let url = urls.first {
-                    loadModel(from: url)
+            .sheet(isPresented: $showModelPicker) {
+                ModelPickerView { modelURL in
+                    showModelPicker = false
+                    loadModel(from: modelURL.deletingLastPathComponent())
                 }
             }
         }
@@ -125,14 +121,15 @@ struct ChatView: View {
     // MARK: - Actions
 
     private func loadModel(from folderURL: URL) {
-        // Look for model.mlpackage in the selected folder
         let modelURL = folderURL.appendingPathComponent("model.mlpackage")
+        messages.append(ChatMessage(role: .system, content: "Loading model..."))
 
         Task {
             do {
                 try await runner.loadModel(from: modelURL)
+                messages.append(ChatMessage(role: .system, content: "Model loaded! Start chatting."))
             } catch {
-                messages.append(ChatMessage(role: .system, content: "Failed to load: \(error.localizedDescription)"))
+                messages.append(ChatMessage(role: .system, content: "Failed: \(error.localizedDescription)"))
             }
         }
     }
