@@ -17,7 +17,7 @@ let package = Package(
         .target(
             name: "CoreMLLLM",
             dependencies: [
-                .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(name: "Transformers", package: "swift-transformers"),
             ]
         ),
     ]
