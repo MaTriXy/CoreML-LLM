@@ -63,6 +63,16 @@ class Gemma4DecoderWrapper(nn.Module):
         self.register_buffer("sin_full", model.sin_full)
         self.full_rotary_dim = model.full_rotary_dim
 
+        # KV sharing (same as gemma4_wrapper.py)
+        self.kv_shared_source = {}
+        self.kv_store_layers = {13, 14}
+        for i in range(self.config.num_hidden_layers):
+            if i >= self.config.num_hidden_layers - self.config.num_kv_shared_layers:
+                if self.config.is_full_attention(i):
+                    self.kv_shared_source[i] = 14
+                else:
+                    self.kv_shared_source[i] = 13
+
     def forward(
         self,
         inputs_embeds: torch.Tensor,     # (1, 1, hidden_size) — already embedded
@@ -83,6 +93,11 @@ class Gemma4DecoderWrapper(nn.Module):
         sin_f = torch.index_select(self.sin_full, 0, position_ids).unsqueeze(0).unsqueeze(0)
 
         # Transformer layers
+        kv_store_13_k = torch.zeros(1, 1, 1, 256, dtype=MODEL_DTYPE)
+        kv_store_13_v = torch.zeros(1, 1, 1, 256, dtype=MODEL_DTYPE)
+        kv_store_14_k = torch.zeros(1, 1, 1, 512, dtype=MODEL_DTYPE)
+        kv_store_14_v = torch.zeros(1, 1, 1, 512, dtype=MODEL_DTYPE)
+
         for layer_idx in range(num_layers):
             layer = self.layers[layer_idx]
             is_full = config.is_full_attention(layer_idx)
@@ -90,52 +105,65 @@ class Gemma4DecoderWrapper(nn.Module):
             num_heads = config.num_attention_heads
             num_kv_heads = config.num_key_value_heads
             n_rep = num_heads // num_kv_heads
-            scale = 1.0  # Gemma 4 uses QK norm, no additional scaling
+            scale = 1.0
 
             residual = hidden_states
             hidden_states = layer.input_layernorm(hidden_states)
 
-            # QKV projection
             x = hidden_states.permute(0, 2, 1).unsqueeze(2).to(MODEL_DTYPE)
+
+            # Q always computed
             q = layer.self_attn["q_proj"](x).view(1, num_heads, hd, 1).permute(0, 1, 3, 2).to(MODEL_DTYPE)
-            k = layer.self_attn["k_proj"](x).view(1, num_kv_heads, hd, 1).permute(0, 1, 3, 2).to(MODEL_DTYPE)
-            v = layer.self_attn["v_proj"](x).view(1, num_kv_heads, hd, 1).permute(0, 1, 3, 2).to(MODEL_DTYPE)
-
-            # QK normalization
             q = layer.self_attn["q_norm"](q.reshape(1, num_heads, hd)).view(1, num_heads, 1, hd)
-            k = layer.self_attn["k_norm"](k.reshape(1, num_kv_heads, hd)).view(1, num_kv_heads, 1, hd)
-            v = v_norm(v)  # RMSNorm without scale on values
-
-            # RoPE (cos/sin already padded to full head_dim)
             if is_full:
-                q, k = apply_rotary_pos_emb(q, k, cos_f, sin_f)
+                q, _ = apply_rotary_pos_emb(q, q, cos_f, sin_f)
             else:
-                q, k = apply_rotary_pos_emb(q, k, cos_s, sin_s)
+                q, _ = apply_rotary_pos_emb(q, q, cos_s, sin_s)
 
-            # KV cache update
+            # KV: compute or share
+            is_kv_shared = config.is_kv_shared(layer_idx)
             k_idx = layer_idx
             v_idx = num_layers + layer_idx
             max_hd = config.global_head_dim
 
-            K_cache = self.kv_cache_0[k_idx].unsqueeze(0)
-            V_cache = self.kv_cache_0[v_idx].unsqueeze(0)
+            if not is_kv_shared:
+                k = layer.self_attn["k_proj"](x).view(1, num_kv_heads, hd, 1).permute(0, 1, 3, 2).to(MODEL_DTYPE)
+                v = layer.self_attn["v_proj"](x).view(1, num_kv_heads, hd, 1).permute(0, 1, 3, 2).to(MODEL_DTYPE)
+                k = layer.self_attn["k_norm"](k.reshape(1, num_kv_heads, hd)).view(1, num_kv_heads, 1, hd)
+                v = v_norm(v)
+                if is_full:
+                    _, k = apply_rotary_pos_emb(k, k, cos_f, sin_f)
+                else:
+                    _, k = apply_rotary_pos_emb(k, k, cos_s, sin_s)
 
-            if hd < max_hd:
-                pad_size = max_hd - hd
-                k_padded = F.pad(k, (0, pad_size))
-                v_padded = F.pad(v, (0, pad_size))
+                K_cache = self.kv_cache_0[k_idx].unsqueeze(0)
+                V_cache = self.kv_cache_0[v_idx].unsqueeze(0)
+                if hd < max_hd:
+                    k_padded = F.pad(k, (0, max_hd - hd))
+                    v_padded = F.pad(v, (0, max_hd - hd))
+                else:
+                    k_padded = k; v_padded = v
+                K_new = K_cache * (1 - update_mask) + k_padded.expand_as(K_cache) * update_mask
+                V_new = V_cache * (1 - update_mask) + v_padded.expand_as(V_cache) * update_mask
+                self.kv_cache_0[k_idx] = K_new.squeeze(0)
+                self.kv_cache_0[v_idx] = V_new.squeeze(0)
+                K_for_attn = K_new[..., :hd]
+                V_for_attn = V_new[..., :hd]
+
+                if layer_idx == 13:
+                    kv_store_13_k = K_new[..., :256]
+                    kv_store_13_v = V_new[..., :256]
+                elif layer_idx == 14:
+                    kv_store_14_k = K_new[..., :512]
+                    kv_store_14_v = V_new[..., :512]
             else:
-                k_padded = k
-                v_padded = v
+                if is_full:
+                    K_for_attn = kv_store_14_k
+                    V_for_attn = kv_store_14_v
+                else:
+                    K_for_attn = kv_store_13_k
+                    V_for_attn = kv_store_13_v
 
-            K_new = K_cache * (1 - update_mask) + k_padded.expand_as(K_cache) * update_mask
-            V_new = V_cache * (1 - update_mask) + v_padded.expand_as(V_cache) * update_mask
-
-            self.kv_cache_0[k_idx] = K_new.squeeze(0)
-            self.kv_cache_0[v_idx] = V_new.squeeze(0)
-
-            K_for_attn = K_new[..., :hd]
-            V_for_attn = V_new[..., :hd]
             K_expanded = K_for_attn.repeat_interleave(n_rep, dim=1)
             V_expanded = V_for_attn.repeat_interleave(n_rep, dim=1)
 
