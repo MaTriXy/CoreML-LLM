@@ -78,18 +78,25 @@ class Gemma4MonolithicWrapper(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,     # (1, 1)
-        position_ids: torch.Tensor,  # (1,)
-        causal_mask: torch.Tensor,   # (1, 1, 1, context_length)
-        update_mask: torch.Tensor,   # (1, 1, context_length, 1)
+        input_ids: torch.Tensor,        # (1, 1) int32 — use PAD (0) for image tokens
+        position_ids: torch.Tensor,     # (1,) int32
+        causal_mask: torch.Tensor,      # (1, 1, 1, context_length) float16
+        update_mask: torch.Tensor,      # (1, 1, context_length, 1) float16
+        image_embedding: torch.Tensor = None,  # (1, 1, hidden_size) float16 — nonzero for image tokens
     ) -> tuple[torch.Tensor, torch.Tensor]:
         config = self.config
         num_layers = config.num_hidden_layers
 
         # --- Embedding ---
-        # Must use tensor scale (not Python float) to match HF's float16 precision
-        hidden_states = self.embed_tokens(input_ids).to(MODEL_DTYPE)
-        hidden_states = hidden_states * torch.tensor(config.hidden_size ** 0.5, dtype=MODEL_DTYPE)
+        text_embedding = self.embed_tokens(input_ids).to(MODEL_DTYPE)
+        text_embedding = text_embedding * torch.tensor(config.hidden_size ** 0.5, dtype=MODEL_DTYPE)
+
+        if image_embedding is not None:
+            # Select: image_embedding where nonzero, text_embedding otherwise
+            is_image = (image_embedding.abs().sum(dim=-1, keepdim=True) > 0).to(MODEL_DTYPE)
+            hidden_states = text_embedding * (1 - is_image) + image_embedding * is_image
+        else:
+            hidden_states = text_embedding
 
         # --- Per-layer embeddings (matches HF project_per_layer_inputs) ---
         # 1. Look up per-layer token embeddings and scale
