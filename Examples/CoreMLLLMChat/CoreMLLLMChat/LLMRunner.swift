@@ -38,7 +38,7 @@ final class LLMRunner {
 
         // Main model
         let mlConfig = MLModelConfiguration()
-        mlConfig.computeUnits = .cpuAndNeuralEngine
+        mlConfig.computeUnits = .all
 
         // Load main model (.mlmodelc = pre-compiled, .mlpackage = needs compile)
         let modelcURL = folder.appendingPathComponent("model.mlmodelc")
