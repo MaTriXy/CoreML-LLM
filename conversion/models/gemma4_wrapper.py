@@ -87,16 +87,17 @@ class Gemma4MonolithicWrapper(nn.Module):
         num_layers = config.num_hidden_layers
 
         # --- Embedding ---
+        # Must use tensor scale (not Python float) to match HF's float16 precision
         hidden_states = self.embed_tokens(input_ids).to(MODEL_DTYPE)
-        hidden_states = hidden_states * (config.hidden_size ** 0.5)
+        hidden_states = hidden_states * torch.tensor(config.hidden_size ** 0.5, dtype=MODEL_DTYPE)
 
         # --- Per-layer embeddings (matches HF project_per_layer_inputs) ---
         # 1. Look up per-layer token embeddings and scale
-        per_layer_raw = self.embed_tokens_per_layer(input_ids).to(MODEL_DTYPE) * self.per_layer_embed_scale
+        per_layer_raw = self.embed_tokens_per_layer(input_ids).to(MODEL_DTYPE) * torch.tensor(self.per_layer_embed_scale, dtype=MODEL_DTYPE)
         # Shape: (1, 1, num_layers * per_layer_dim) = (1, 1, 8960)
 
         # 2. Project main embeddings to per-layer space
-        per_layer_proj = self.per_layer_model_projection(hidden_states.float()).to(MODEL_DTYPE) * self.per_layer_model_projection_scale
+        per_layer_proj = self.per_layer_model_projection(hidden_states.float()).to(MODEL_DTYPE) * torch.tensor(self.per_layer_model_projection_scale, dtype=MODEL_DTYPE)
 
         # 3. Apply norm to projection per-layer slices (HF does this BEFORE combining)
         # We apply norm to each 256-dim slice of the 8960-dim projection
@@ -108,7 +109,7 @@ class Gemma4MonolithicWrapper(nn.Module):
         per_layer_proj_normed = torch.cat(normed_slices, dim=-1)
 
         # 4. Combine: (normed_projection + raw) * input_scale
-        per_layer_combined = (per_layer_proj_normed + per_layer_raw) * self.per_layer_input_scale
+        per_layer_combined = (per_layer_proj_normed + per_layer_raw) * torch.tensor(self.per_layer_input_scale, dtype=MODEL_DTYPE)
 
         # --- Get RoPE for both types ---
         cos_s = torch.index_select(self.cos_sliding, 0, position_ids).unsqueeze(0).unsqueeze(0)
@@ -131,7 +132,7 @@ class Gemma4MonolithicWrapper(nn.Module):
             num_heads = config.num_attention_heads
             num_kv_heads = config.num_key_value_heads
             n_rep = num_heads // num_kv_heads
-            scale = 1.0 / (hd ** 0.5)
+            scale = 1.0  # Gemma 4 uses QK norm, no additional scaling
 
             residual = hidden_states
             hidden_states = layer.input_layernorm(hidden_states)

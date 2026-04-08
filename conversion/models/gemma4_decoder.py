@@ -90,7 +90,7 @@ class Gemma4DecoderWrapper(nn.Module):
             num_heads = config.num_attention_heads
             num_kv_heads = config.num_key_value_heads
             n_rep = num_heads // num_kv_heads
-            scale = 1.0 / (hd ** 0.5)
+            scale = 1.0  # Gemma 4 uses QK norm, no additional scaling
 
             residual = hidden_states
             hidden_states = layer.input_layernorm(hidden_states)
