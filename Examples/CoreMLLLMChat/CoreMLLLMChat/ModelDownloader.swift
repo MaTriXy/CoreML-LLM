@@ -156,6 +156,8 @@ final class ModelDownloader: NSObject {
                 .init(remotePath: "chunk3.mlmodelc/analytics/coremldata.bin", localPath: "chunk3.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
                 .init(remotePath: "model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
                 .init(remotePath: "hf_model/tokenizer.json", localPath: "hf_model/tokenizer.json", estimatedSize: 30_000_000),
+                .init(remotePath: "hf_model/tokenizer_config.json", localPath: "hf_model/tokenizer_config.json", estimatedSize: 5_000),
+                .init(remotePath: "hf_model/config.json", localPath: "hf_model/config.json", estimatedSize: 5_000),
             ]
         } else {
             // Monolithic model
@@ -167,6 +169,8 @@ final class ModelDownloader: NSObject {
                 .init(remotePath: "model.mlmodelc/analytics/coremldata.bin", localPath: "model.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
                 .init(remotePath: "model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
                 .init(remotePath: "hf_model/tokenizer.json", localPath: "hf_model/tokenizer.json", estimatedSize: 30_000_000),
+                .init(remotePath: "hf_model/tokenizer_config.json", localPath: "hf_model/tokenizer_config.json", estimatedSize: 5_000),
+                .init(remotePath: "hf_model/config.json", localPath: "hf_model/config.json", estimatedSize: 5_000),
             ]
         }
 
