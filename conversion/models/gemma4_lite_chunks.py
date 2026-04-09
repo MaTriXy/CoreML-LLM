@@ -13,12 +13,12 @@ import torch.nn.functional as F
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb
+from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb, ane_softmax, repeat_kv_ane
 
 
 def v_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    mean_sq = x.float().pow(2).mean(-1, keepdim=True) + eps
-    return (x.float() * torch.pow(mean_sq, -0.5)).to(x.dtype)
+    mean_sq = x.pow(2).mean(-1, keepdim=True) + eps
+    return x * torch.rsqrt(mean_sq)
 
 from .gemma4 import Gemma4Model
 
@@ -86,12 +86,12 @@ def _run_layer(layer, layer_idx, hidden_states, cos_s, sin_s, cos_f, sin_f,
             K_for_attn = kv_store_13_k
             V_for_attn = kv_store_13_v
 
-    K_expanded = K_for_attn.repeat_interleave(n_rep, dim=1)
-    V_expanded = V_for_attn.repeat_interleave(n_rep, dim=1)
+    K_expanded = repeat_kv_ane(K_for_attn, n_rep)
+    V_expanded = repeat_kv_ane(V_for_attn, n_rep)
 
     attn_weights = torch.matmul(q, K_expanded.transpose(-1, -2))
     attn_weights = attn_weights + causal_mask
-    attn_weights = torch.softmax(attn_weights, dim=-1)
+    attn_weights = ane_softmax(attn_weights, dim=-1)
     attn_output = torch.matmul(attn_weights, V_expanded)
 
     attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(1, 1, -1)

@@ -33,20 +33,15 @@ class ANERMSNorm(nn.Module):
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        # fp16 weight to prevent fp32 upcast during multiply
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=MODEL_DTYPE))
         self.eps = eps
         self.hidden_size = hidden_size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-
-        # Compute in float32 (matches HF's Gemma4RMSNorm which casts to float32)
-        x = x.float()
-
-        # Step 1: Make mean zero by doubling with negation
+        # All fp16 for ANE compatibility (no float32 cast)
+        # Matches ANEMLL's LlamaRMSNorm pattern.
         doubled = torch.cat([x, -x], dim=-1)
-
-        # Step 2: LayerNorm on doubled tensor (ANE-optimized kernel)
         normed = F.layer_norm(
             doubled,
             normalized_shape=(2 * self.hidden_size,),
@@ -54,12 +49,9 @@ class ANERMSNorm(nn.Module):
             bias=None,
             eps=float(self.eps),
         )
-
-        # Step 3: Keep only the first half using chunk (avoids dynamic shape int)
+        # Drop mirror half: use chunk to avoid dynamic slice during trace
         normed, _ = torch.chunk(normed, 2, dim=-1)
-
-        # Step 4: Apply learnable scale and cast back
-        return (normed * self.weight.float()).to(input_dtype)
+        return normed * self.weight
 
 
 class Conv2dLinear(nn.Module):
@@ -161,14 +153,42 @@ def apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
+def ane_softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Numerically stable softmax using only ANE-friendly primitives.
+
+    Avoids the softmax op entirely: max, sub, exp, sum, div.
+    All casts explicit to prevent PyTorch fp16→fp32 auto-upcast in torch.exp.
+    """
+    # Force fp16 throughout; torch.exp auto-upcasts without this.
+    x = x.to(MODEL_DTYPE)
+    x_max = x.max(dim=dim, keepdim=True).values.to(MODEL_DTYPE)
+    x_shifted = (x - x_max).to(MODEL_DTYPE)
+    exp_x = torch.exp(x_shifted).to(MODEL_DTYPE)
+    exp_sum = exp_x.sum(dim=dim, keepdim=True).to(MODEL_DTYPE)
+    return (exp_x / exp_sum).to(MODEL_DTYPE)
+
+
+def repeat_kv_ane(hidden_states: torch.Tensor, n_rep: int,
+                   num_kv_heads: int, seq_len: int, head_dim: int) -> torch.Tensor:
+    """GQA repeat using reshape+repeat+view instead of repeat_interleave.
+
+    ANEMLL pattern: shapes passed explicitly (no .shape access for trace).
+
+    Input:  (1, num_kv_heads, seq, head_dim)
+    Output: (1, num_kv_heads * n_rep, seq, head_dim)
+    """
+    if n_rep == 1:
+        return hidden_states
+    # (1, kv, S, D) → (1, kv, 1, S, D) → (1, kv, rep, S, D) → (1, kv*rep, S, D)
+    hidden_states = hidden_states.unsqueeze(2)
+    hidden_states = hidden_states.repeat(1, 1, n_rep, 1, 1)
+    return hidden_states.view(1, num_kv_heads * n_rep, seq_len, head_dim)
+
+
 def repeat_kv(
     hidden_states: torch.Tensor, n_rep: int
 ) -> torch.Tensor:
-    """Repeat KV heads to match the number of query heads (for GQA).
-
-    Input:  (batch, num_kv_heads, seq, head_dim)
-    Output: (batch, num_kv_heads * n_rep, seq, head_dim)
-    """
+    """Legacy GQA repeat. Use repeat_kv_ane for ANE."""
     if n_rep == 1:
         return hidden_states
     batch, num_kv_heads, seq_len, head_dim = hidden_states.shape
