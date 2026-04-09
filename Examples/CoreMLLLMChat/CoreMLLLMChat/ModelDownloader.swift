@@ -26,12 +26,9 @@ final class ModelDownloader: NSObject {
         let folderName: String
 
         static let defaults: [ModelInfo] = [
-            ModelInfo(id: "gemma4-e2b", name: "Gemma 4 E2B (Multimodal)", size: "2.7 GB",
+            ModelInfo(id: "gemma4-e2b", name: "Gemma 4 E2B", size: "2.5 GB",
                       downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml/resolve/main",
                       folderName: "gemma4-e2b"),
-            ModelInfo(id: "gemma4-e2b-chunked", name: "Gemma 4 E2B Chunked (iPhone)", size: "2.7 GB",
-                      downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml/resolve/main",
-                      folderName: "gemma4-e2b-chunked"),
             ModelInfo(id: "qwen2.5-0.5b", name: "Qwen2.5 0.5B (Text)", size: "309 MB",
                       downloadURL: "https://github.com/john-rocky/CoreML-LLM/releases/download/v0.1.0/qwen2.5-0.5b-coreml.zip",
                       folderName: "qwen2.5-0.5b"),
@@ -136,66 +133,18 @@ final class ModelDownloader: NSObject {
 
         var files: [DownloadFile]
 
-        if model.id.contains("chunked") {
-            // Chunked model for iPhone
-            files = [
-                .init(remotePath: "chunk1.mlmodelc/weights/weight.bin", localPath: "chunk1.mlmodelc/weights/weight.bin", estimatedSize: 1_535_000_000),
-                .init(remotePath: "chunk1.mlmodelc/coremldata.bin", localPath: "chunk1.mlmodelc/coremldata.bin", estimatedSize: 500_000),
-                .init(remotePath: "chunk1.mlmodelc/model.mil", localPath: "chunk1.mlmodelc/model.mil", estimatedSize: 100_000),
-                .init(remotePath: "chunk1.mlmodelc/metadata.json", localPath: "chunk1.mlmodelc/metadata.json", estimatedSize: 1_000),
-                .init(remotePath: "chunk1.mlmodelc/analytics/coremldata.bin", localPath: "chunk1.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
-                .init(remotePath: "chunk2.mlmodelc/weights/weight.bin", localPath: "chunk2.mlmodelc/weights/weight.bin", estimatedSize: 333_000_000),
-                .init(remotePath: "chunk2.mlmodelc/coremldata.bin", localPath: "chunk2.mlmodelc/coremldata.bin", estimatedSize: 500_000),
-                .init(remotePath: "chunk2.mlmodelc/model.mil", localPath: "chunk2.mlmodelc/model.mil", estimatedSize: 100_000),
-                .init(remotePath: "chunk2.mlmodelc/metadata.json", localPath: "chunk2.mlmodelc/metadata.json", estimatedSize: 1_000),
-                .init(remotePath: "chunk2.mlmodelc/analytics/coremldata.bin", localPath: "chunk2.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
-                .init(remotePath: "chunk3.mlmodelc/weights/weight.bin", localPath: "chunk3.mlmodelc/weights/weight.bin", estimatedSize: 537_000_000),
-                .init(remotePath: "chunk3.mlmodelc/coremldata.bin", localPath: "chunk3.mlmodelc/coremldata.bin", estimatedSize: 500_000),
-                .init(remotePath: "chunk3.mlmodelc/model.mil", localPath: "chunk3.mlmodelc/model.mil", estimatedSize: 100_000),
-                .init(remotePath: "chunk3.mlmodelc/metadata.json", localPath: "chunk3.mlmodelc/metadata.json", estimatedSize: 1_000),
-                .init(remotePath: "chunk3.mlmodelc/analytics/coremldata.bin", localPath: "chunk3.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
-                .init(remotePath: "model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
-                .init(remotePath: "hf_model/tokenizer.json", localPath: "hf_model/tokenizer.json", estimatedSize: 30_000_000),
-                .init(remotePath: "hf_model/tokenizer_config.json", localPath: "hf_model/tokenizer_config.json", estimatedSize: 5_000),
-                .init(remotePath: "hf_model/config.json", localPath: "hf_model/config.json", estimatedSize: 5_000),
-                // External embeddings
-                .init(remotePath: "embed_tokens_q8.bin", localPath: "embed_tokens_q8.bin", estimatedSize: 402_653_184),
-                .init(remotePath: "embed_tokens_scales.bin", localPath: "embed_tokens_scales.bin", estimatedSize: 524_288),
-                .init(remotePath: "embed_tokens_per_layer_q8.bin", localPath: "embed_tokens_per_layer_q8.bin", estimatedSize: 2_348_810_240),
-                .init(remotePath: "embed_tokens_per_layer_scales.bin", localPath: "embed_tokens_per_layer_scales.bin", estimatedSize: 524_288),
-                // Per-layer projection
-                .init(remotePath: "per_layer_projection.bin", localPath: "per_layer_projection.bin", estimatedSize: 27_525_120),
-                .init(remotePath: "per_layer_norm_weight.bin", localPath: "per_layer_norm_weight.bin", estimatedSize: 1_024),
-                // RoPE tables
-                .init(remotePath: "cos_sliding.npy", localPath: "cos_sliding.npy", estimatedSize: 524_416),
-                .init(remotePath: "sin_sliding.npy", localPath: "sin_sliding.npy", estimatedSize: 524_416),
-                .init(remotePath: "cos_full.npy", localPath: "cos_full.npy", estimatedSize: 1_048_704),
-                .init(remotePath: "sin_full.npy", localPath: "sin_full.npy", estimatedSize: 1_048_704),
-            ]
-        } else {
-            // Monolithic model
-            files = [
-                .init(remotePath: "model.mlmodelc/weights/weight.bin", localPath: "model.mlmodelc/weights/weight.bin", estimatedSize: 2_500_000_000),
-                .init(remotePath: "model.mlmodelc/coremldata.bin", localPath: "model.mlmodelc/coremldata.bin", estimatedSize: 500_000),
-                .init(remotePath: "model.mlmodelc/model.mil", localPath: "model.mlmodelc/model.mil", estimatedSize: 100_000),
-                .init(remotePath: "model.mlmodelc/metadata.json", localPath: "model.mlmodelc/metadata.json", estimatedSize: 1_000),
-                .init(remotePath: "model.mlmodelc/analytics/coremldata.bin", localPath: "model.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
-                .init(remotePath: "model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
-                .init(remotePath: "hf_model/tokenizer.json", localPath: "hf_model/tokenizer.json", estimatedSize: 30_000_000),
-                .init(remotePath: "hf_model/tokenizer_config.json", localPath: "hf_model/tokenizer_config.json", estimatedSize: 5_000),
-                .init(remotePath: "hf_model/config.json", localPath: "hf_model/config.json", estimatedSize: 5_000),
-            ]
-        }
-
-        if model.id.contains("gemma") {
-            files += [
-                .init(remotePath: "vision.mlmodelc/weights/weight.bin", localPath: "vision.mlmodelc/weights/weight.bin", estimatedSize: 320_000_000),
-                .init(remotePath: "vision.mlmodelc/coremldata.bin", localPath: "vision.mlmodelc/coremldata.bin", estimatedSize: 200_000),
-                .init(remotePath: "vision.mlmodelc/model.mil", localPath: "vision.mlmodelc/model.mil", estimatedSize: 50_000),
-                .init(remotePath: "vision.mlmodelc/metadata.json", localPath: "vision.mlmodelc/metadata.json", estimatedSize: 1_000),
-                .init(remotePath: "vision.mlmodelc/analytics/coremldata.bin", localPath: "vision.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
-            ]
-        }
+        // Monolithic model (embeddings inside CoreML, managed by JIT decompression)
+        files = [
+            .init(remotePath: "model.mlmodelc/weights/weight.bin", localPath: "model.mlmodelc/weights/weight.bin", estimatedSize: 2_500_000_000),
+            .init(remotePath: "model.mlmodelc/coremldata.bin", localPath: "model.mlmodelc/coremldata.bin", estimatedSize: 500_000),
+            .init(remotePath: "model.mlmodelc/model.mil", localPath: "model.mlmodelc/model.mil", estimatedSize: 100_000),
+            .init(remotePath: "model.mlmodelc/metadata.json", localPath: "model.mlmodelc/metadata.json", estimatedSize: 1_000),
+            .init(remotePath: "model.mlmodelc/analytics/coremldata.bin", localPath: "model.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
+            .init(remotePath: "model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
+            .init(remotePath: "hf_model/tokenizer.json", localPath: "hf_model/tokenizer.json", estimatedSize: 30_000_000),
+            .init(remotePath: "hf_model/tokenizer_config.json", localPath: "hf_model/tokenizer_config.json", estimatedSize: 5_000),
+            .init(remotePath: "hf_model/config.json", localPath: "hf_model/config.json", estimatedSize: 5_000),
+        ]
 
         totalBytesForAllFiles = files.reduce(0) { $0 + $1.estimatedSize }
         completedBytesForPreviousFiles = 0

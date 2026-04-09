@@ -281,8 +281,11 @@ final class LLMRunner {
     // MARK: - Monolithic Prediction
 
     private func predictMonolithic(tokenID: Int, position: Int, imageEmbedding: MLMultiArray? = nil) throws -> Int {
-        guard let model, let state else { throw NSError(domain: "", code: 0) }
-        let ctx = contextLength, hs = hiddenSize
+        guard let model, let state else {
+            throw NSError(domain: "LLMRunner", code: 0,
+                          userInfo: [NSLocalizedDescriptionKey: "Model or state not initialized"])
+        }
+        let ctx = contextLength
 
         let ids = try MLMultiArray(shape: [1, 1], dataType: .int32)
         ids[[0, 0] as [NSNumber]] = NSNumber(value: Int32(tokenID))
@@ -291,21 +294,28 @@ final class LLMRunner {
         let mask = try makeCausalMask(position: position, contextLength: ctx)
         let umask = try makeUpdateMask(position: position, contextLength: ctx)
 
-        let imgEmb: MLMultiArray
-        if let imageEmbedding {
-            imgEmb = imageEmbedding
-        } else {
-            imgEmb = try MLMultiArray(shape: [1, 1, NSNumber(value: hs)], dataType: .float16)
-            memset(imgEmb.dataPointer, 0, hs * MemoryLayout<UInt16>.stride)
-        }
-
-        let input = try MLDictionaryFeatureProvider(dictionary: [
+        var dict: [String: MLFeatureValue] = [
             "input_ids": MLFeatureValue(multiArray: ids),
             "position_ids": MLFeatureValue(multiArray: pos),
             "causal_mask": MLFeatureValue(multiArray: mask),
             "update_mask": MLFeatureValue(multiArray: umask),
-            "image_embedding": MLFeatureValue(multiArray: imgEmb),
-        ])
+        ]
+
+        // Only pass image_embedding if the model accepts it
+        if let spec = try? model.modelDescription.inputDescriptionsByName,
+           spec["image_embedding"] != nil {
+            let hs = hiddenSize
+            let imgEmb: MLMultiArray
+            if let imageEmbedding {
+                imgEmb = imageEmbedding
+            } else {
+                imgEmb = try MLMultiArray(shape: [1, 1, NSNumber(value: hs)], dataType: .float16)
+                memset(imgEmb.dataPointer, 0, hs * MemoryLayout<UInt16>.stride)
+            }
+            dict["image_embedding"] = MLFeatureValue(multiArray: imgEmb)
+        }
+
+        let input = try MLDictionaryFeatureProvider(dictionary: dict)
         let output = try model.prediction(from: input, using: state)
         return output.featureValue(for: "token_id")!.multiArrayValue![0].intValue
     }
