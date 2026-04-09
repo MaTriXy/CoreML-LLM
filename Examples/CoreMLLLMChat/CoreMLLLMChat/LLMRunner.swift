@@ -197,17 +197,38 @@ final class LLMRunner {
         // chunk2: layers 8-14 (contains KV sources 13/14), KV cache I/O (7 slots) + kv13/14 output
         // chunk3: layers 15-24 (all shared), no KV cache, uses kv13/14
         // chunk4: layers 25-34 (all shared) + norm + lm_head, no KV cache, uses kv13/14
+        //
+        // Each chunk is a multifunction mlpackage exposing two functions:
+        //   - "decode"  (seq=1 SWA, used during token-by-token generation)
+        //   - "prefill" (seq=512, used for batched prompt processing)
+        // Both functions share the same weight blob on disk and in memory.
+        let decodeCfg = MLModelConfiguration()
+        decodeCfg.computeUnits = mlConfig.computeUnits
+        decodeCfg.functionName = "decode"
+
+        let prefillCfg = MLModelConfiguration()
+        prefillCfg.computeUnits = mlConfig.computeUnits
+        prefillCfg.functionName = "prefill"
+
         loadingStatus = "Loading chunk 1/4..."
-        chunk1 = try MLModel(contentsOf: findModel(in: folder, name: "chunk1")!, configuration: mlConfig)
+        let url1 = findModel(in: folder, name: "chunk1")!
+        chunk1        = try MLModel(contentsOf: url1, configuration: decodeCfg)
+        prefillChunk1 = try? MLModel(contentsOf: url1, configuration: prefillCfg)
 
         loadingStatus = "Loading chunk 2/4..."
-        chunk2 = try MLModel(contentsOf: findModel(in: folder, name: "chunk2")!, configuration: mlConfig)
+        let url2 = findModel(in: folder, name: "chunk2")!
+        chunk2        = try MLModel(contentsOf: url2, configuration: decodeCfg)
+        prefillChunk2 = try? MLModel(contentsOf: url2, configuration: prefillCfg)
 
         loadingStatus = "Loading chunk 3/4..."
-        chunk3 = try MLModel(contentsOf: findModel(in: folder, name: "chunk3")!, configuration: mlConfig)
+        let url3 = findModel(in: folder, name: "chunk3")!
+        chunk3        = try MLModel(contentsOf: url3, configuration: decodeCfg)
+        prefillChunk3 = try? MLModel(contentsOf: url3, configuration: prefillCfg)
 
         loadingStatus = "Loading chunk 4/4..."
-        chunk4 = try MLModel(contentsOf: findModel(in: folder, name: "chunk4")!, configuration: mlConfig)
+        let url4 = findModel(in: folder, name: "chunk4")!
+        chunk4        = try MLModel(contentsOf: url4, configuration: decodeCfg)
+        prefillChunk4 = try? MLModel(contentsOf: url4, configuration: prefillCfg)
 
         // Allocate persistent SWA KV cache buffers
         loadingStatus = "Allocating KV cache..."
@@ -253,25 +274,6 @@ final class LLMRunner {
         sinSlidingTable = try? Data(contentsOf: folder.appendingPathComponent("sin_sliding.npy"), options: .mappedIfSafe)
         cosFullTable = try? Data(contentsOf: folder.appendingPathComponent("cos_full.npy"), options: .mappedIfSafe)
         sinFullTable = try? Data(contentsOf: folder.appendingPathComponent("sin_full.npy"), options: .mappedIfSafe)
-
-        // Optional: load prefill chunks (seq=64 batch) for fast TTFT.
-        // Graceful fallback to per-token decode if missing.
-        if let p1 = findModel(in: folder, name: "prefill_chunk1") {
-            loadingStatus = "Loading prefill chunk 1/4..."
-            prefillChunk1 = try? MLModel(contentsOf: p1, configuration: mlConfig)
-            if let p2 = findModel(in: folder, name: "prefill_chunk2") {
-                loadingStatus = "Loading prefill chunk 2/4..."
-                prefillChunk2 = try? MLModel(contentsOf: p2, configuration: mlConfig)
-            }
-            if let p3 = findModel(in: folder, name: "prefill_chunk3") {
-                loadingStatus = "Loading prefill chunk 3/4..."
-                prefillChunk3 = try? MLModel(contentsOf: p3, configuration: mlConfig)
-            }
-            if let p4 = findModel(in: folder, name: "prefill_chunk4") {
-                loadingStatus = "Loading prefill chunk 4/4..."
-                prefillChunk4 = try? MLModel(contentsOf: p4, configuration: mlConfig)
-            }
-        }
 
         useExternalPLE = true
         isChunked = true
