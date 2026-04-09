@@ -66,18 +66,22 @@ class Gemma4LiteWrapper(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,           # (1, 1) int32
+        input_ids: torch.Tensor,           # (1, 1) int32 — use PAD (0) for image positions
         position_ids: torch.Tensor,        # (1,) int32
         causal_mask: torch.Tensor,         # (1, 1, 1, context_length) float16
         update_mask: torch.Tensor,         # (1, 1, context_length, 1) float16
         per_layer_combined: torch.Tensor,  # (1, 1, num_layers * per_layer_dim) float16
+        image_embedding: torch.Tensor,     # (1, 1, hidden_size) float16 — nonzero = image position
     ) -> tuple[torch.Tensor, torch.Tensor]:
         config = self.config
         num_layers = config.num_hidden_layers
 
         # --- Embedding ---
-        hidden_states = self.embed_tokens(input_ids).to(MODEL_DTYPE)
-        hidden_states = hidden_states * torch.tensor(config.hidden_size ** 0.5, dtype=MODEL_DTYPE)
+        text_embedding = self.embed_tokens(input_ids).to(MODEL_DTYPE)
+        text_embedding = text_embedding * torch.tensor(config.hidden_size ** 0.5, dtype=MODEL_DTYPE)
+        # Select image embedding if nonzero, otherwise text
+        is_image = (image_embedding.abs().sum(dim=-1, keepdim=True) > 0).to(MODEL_DTYPE)
+        hidden_states = text_embedding * (1 - is_image) + image_embedding * is_image
 
         # per_layer_combined is passed in (computed externally in Swift)
 

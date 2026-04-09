@@ -52,6 +52,12 @@ final class LLMRunner {
     private var architecture = "gemma4"
     private var useExternalPLE = false
     private var currentPosition = 0
+
+    // Profiling
+    private var profileEmbed: Double = 0
+    private var profilePLE: Double = 0
+    private var profilePredict: Double = 0
+    private var profileCount: Int = 0
     private var embedScale: Float = 39.19
     private var perLayerProjScale: Float = 0.0255
     private var perLayerInputScale: Float = 0.707
@@ -343,9 +349,13 @@ final class LLMRunner {
 
         // External PLE: compute per_layer_combined and pass as input
         if useExternalPLE {
-            // Need embedding for per-layer computation
+            let t0 = CFAbsoluteTimeGetCurrent()
             let emb = try embedTokens!.lookup(tokenID, shape: [1, 1, NSNumber(value: hiddenSize)])
+            let t1 = CFAbsoluteTimeGetCurrent()
             let plc = try computePerLayerCombined(tokenID: tokenID, embedding: emb)
+            let t2 = CFAbsoluteTimeGetCurrent()
+            profileEmbed += (t1 - t0)
+            profilePLE += (t2 - t1)
             dict["per_layer_combined"] = MLFeatureValue(multiArray: plc)
         }
 
@@ -364,7 +374,21 @@ final class LLMRunner {
         }
 
         let input = try MLDictionaryFeatureProvider(dictionary: dict)
+        let tp = CFAbsoluteTimeGetCurrent()
         let output = try model.prediction(from: input, using: state)
+        profilePredict += (CFAbsoluteTimeGetCurrent() - tp)
+        profileCount += 1
+
+        if profileCount % 10 == 0 {
+            let n = Double(profileCount)
+            let eMs = profileEmbed/n * 1000
+            let pMs = profilePLE/n * 1000
+            let prMs = profilePredict/n * 1000
+            let total = eMs + pMs + prMs
+            print(String(format: "[Profile] emb=%.1fms ple=%.1fms predict=%.1fms total=%.1fms (%.1f tok/s)",
+                         eMs, pMs, prMs, total, 1000.0/total))
+        }
+
         return output.featureValue(for: "token_id")!.multiArrayValue![0].intValue
     }
 
