@@ -26,6 +26,13 @@ final class LLMRunner {
     private var chunk1State: MLState?  // unused
     private var chunk2State: MLState?  // unused
     private var isChunked = false
+
+    // Prefill chunks (seq=64 batch prefill; optional, decode-only if missing)
+    private var prefillChunk1: MLModel?
+    private var prefillChunk2: MLModel?
+    private var prefillChunk3: MLModel?
+    private var prefillChunk4: MLModel?
+    private let prefillN = 64
     // SWA KV buffers: separate sliding (W=512) and full (ctx) per chunk
     private var kSliding1: MLMultiArray?  // (7, 1, W, max_hd)
     private var vSliding1: MLMultiArray?
@@ -245,6 +252,25 @@ final class LLMRunner {
         cosFullTable = try? Data(contentsOf: folder.appendingPathComponent("cos_full.npy"), options: .mappedIfSafe)
         sinFullTable = try? Data(contentsOf: folder.appendingPathComponent("sin_full.npy"), options: .mappedIfSafe)
 
+        // Optional: load prefill chunks (seq=64 batch) for fast TTFT.
+        // Graceful fallback to per-token decode if missing.
+        if let p1 = findModel(in: folder, name: "prefill_chunk1") {
+            loadingStatus = "Loading prefill chunk 1/4..."
+            prefillChunk1 = try? MLModel(contentsOf: p1, configuration: mlConfig)
+            if let p2 = findModel(in: folder, name: "prefill_chunk2") {
+                loadingStatus = "Loading prefill chunk 2/4..."
+                prefillChunk2 = try? MLModel(contentsOf: p2, configuration: mlConfig)
+            }
+            if let p3 = findModel(in: folder, name: "prefill_chunk3") {
+                loadingStatus = "Loading prefill chunk 3/4..."
+                prefillChunk3 = try? MLModel(contentsOf: p3, configuration: mlConfig)
+            }
+            if let p4 = findModel(in: folder, name: "prefill_chunk4") {
+                loadingStatus = "Loading prefill chunk 4/4..."
+                prefillChunk4 = try? MLModel(contentsOf: p4, configuration: mlConfig)
+            }
+        }
+
         useExternalPLE = true
         isChunked = true
     }
@@ -353,18 +379,37 @@ final class LLMRunner {
                         continuation.finish()
                         return
                     }
-                    for (step, tid) in tokenIDs.enumerated() {
+
+                    // Fast path: batched prefill (seq=N) when no image + prompt fits in one batch.
+                    // Single CoreML call replaces N per-token decode calls.
+                    let canPrefill = self.isChunked
+                        && imageFeatures == nil
+                        && self.prefillChunk1 != nil
+                        && self.prefillChunk2 != nil
+                        && self.prefillChunk3 != nil
+                        && self.prefillChunk4 != nil
+                        && tokenIDs.count <= self.prefillN
+                        && tokenIDs.count > 0
+                    if canPrefill {
+                        self.loadingStatus = "Prefill (batch \(tokenIDs.count))..."
                         try autoreleasepool {
-                            if tid == IMAGE_TOKEN_ID, let feats = imageFeatures, imageIdx < 280 {
-                                let imgEmb = self.sliceFeature(feats, at: imageIdx)
-                                nextID = try self.predictStep(tokenID: 0, position: step, imageEmbedding: imgEmb)
-                                imageIdx += 1
-                            } else {
-                                nextID = try self.predictStep(tokenID: tid, position: step)
-                            }
+                            nextID = try self.runPrefill(tokenIDs: tokenIDs)
                         }
-                        self.currentPosition = step + 1
-                        self.loadingStatus = "Prefill \(step + 1)/\(tokenIDs.count)..."
+                        self.currentPosition = tokenIDs.count
+                    } else {
+                        for (step, tid) in tokenIDs.enumerated() {
+                            try autoreleasepool {
+                                if tid == IMAGE_TOKEN_ID, let feats = imageFeatures, imageIdx < 280 {
+                                    let imgEmb = self.sliceFeature(feats, at: imageIdx)
+                                    nextID = try self.predictStep(tokenID: 0, position: step, imageEmbedding: imgEmb)
+                                    imageIdx += 1
+                                } else {
+                                    nextID = try self.predictStep(tokenID: tid, position: step)
+                                }
+                            }
+                            self.currentPosition = step + 1
+                            self.loadingStatus = "Prefill \(step + 1)/\(tokenIDs.count)..."
+                        }
                     }
                     self.loadingStatus = "Generating..."
 
@@ -648,6 +693,292 @@ final class LLMRunner {
                          1000.0 / ((profileEmbed + profilePLE + profilePredict) / n * 1000)))
         }
         return out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
+    }
+
+    // MARK: - Batched Prefill (seq=N)
+
+    /// Run a single prefill pass over up to N=prefillN tokens, writing K/V for
+    /// positions [0, realLen) into the persistent SWA decode caches. After this
+    /// call, `currentPosition` should be set to `realLen` by the caller and decode
+    /// continues from the returned token id.
+    private func runPrefill(tokenIDs: [Int]) throws -> Int {
+        guard let p1 = prefillChunk1, let p2 = prefillChunk2,
+              let p3 = prefillChunk3, let p4 = prefillChunk4,
+              let embedTokens,
+              let ks1 = kSliding1, let vs1 = vSliding1,
+              let kf1 = kFull1, let vf1 = vFull1,
+              let ks2 = kSliding2, let vs2 = vSliding2,
+              let kf2 = kFull2, let vf2 = vFull2 else {
+            throw NSError(domain: "LLMRunner", code: 10,
+                          userInfo: [NSLocalizedDescriptionKey: "Prefill chunks or caches not loaded"])
+        }
+        let N = prefillN
+        let realLen = tokenIDs.count
+        precondition(realLen > 0 && realLen <= N, "prefill needs 1..N tokens")
+
+        // Reset KV caches — prefill assumes starting position 0.
+        for buf in [kSliding1, vSliding1, kFull1, vFull1, kSliding2, vSliding2, kFull2, vFull2] {
+            if let b = buf {
+                memset(b.dataPointer, 0, b.count * MemoryLayout<UInt16>.stride)
+            }
+        }
+
+        let tStart = CFAbsoluteTimeGetCurrent()
+
+        // Build inputs common to all chunks.
+        let hiddenIn = try buildPrefillHiddenStates(tokenIDs: tokenIDs, N: N, embedTokens: embedTokens)
+        let plRaw = try buildPrefillPerLayerRaw(tokenIDs: tokenIDs, N: N)
+        let causal = try makePrefillCausalMask(N: N)
+        let cosS = try buildPrefillRoPE(table: cosSlidingTable, N: N, dim: 256)
+        let sinS = try buildPrefillRoPE(table: sinSlidingTable, N: N, dim: 256)
+        let cosF = try buildPrefillRoPE(table: cosFullTable, N: N, dim: 512)
+        let sinF = try buildPrefillRoPE(table: sinFullTable, N: N, dim: 512)
+        let lastMask = try makeLastPositionMask(N: N, realLen: realLen)
+
+        // ---- Prefill Chunk 1 (L0-7): computes PLE inside. ----
+        let input1 = try MLDictionaryFeatureProvider(dictionary: [
+            "hidden_states": MLFeatureValue(multiArray: hiddenIn),
+            "causal_mask": MLFeatureValue(multiArray: causal),
+            "per_layer_raw": MLFeatureValue(multiArray: plRaw),
+            "cos_s": MLFeatureValue(multiArray: cosS),
+            "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF),
+            "sin_f": MLFeatureValue(multiArray: sinF),
+        ])
+        let out1 = try p1.prediction(from: input1)
+        let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
+        let plc = out1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!
+
+        // chunk1 slot → kSliding1 mapping: [L0..3, L4=full, L5..7]
+        // Sliding-slot order (sliding_map): L0→0, L1→1, L2→2, L3→3, L5→4, L6→5, L7→6
+        // Full-slot order: L4→0
+        try writeSlidingFromPrefill(src: out1, name: "K0", slotKV: ks1, slot: 0, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out1, name: "V0", slotKV: vs1, slot: 0, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out1, name: "K1", slotKV: ks1, slot: 1, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out1, name: "V1", slotKV: vs1, slot: 1, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out1, name: "K2", slotKV: ks1, slot: 2, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out1, name: "V2", slotKV: vs1, slot: 2, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out1, name: "K3", slotKV: ks1, slot: 3, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out1, name: "V3", slotKV: vs1, slot: 3, realLen: realLen, hd: 256)
+        try writeFullFromPrefill(src: out1, name: "K4", slotKV: kf1, slot: 0, realLen: realLen, hd: 512)
+        try writeFullFromPrefill(src: out1, name: "V4", slotKV: vf1, slot: 0, realLen: realLen, hd: 512)
+        try writeSlidingFromPrefill(src: out1, name: "K5", slotKV: ks1, slot: 4, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out1, name: "V5", slotKV: vs1, slot: 4, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out1, name: "K6", slotKV: ks1, slot: 5, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out1, name: "V6", slotKV: vs1, slot: 5, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out1, name: "K7", slotKV: ks1, slot: 6, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out1, name: "V7", slotKV: vs1, slot: 6, realLen: realLen, hd: 256)
+
+        // ---- Prefill Chunk 2 (L8-14): outputs K0..K4 + kv13/kv14. ----
+        let input2 = try MLDictionaryFeatureProvider(dictionary: [
+            "hidden_states": MLFeatureValue(multiArray: h1),
+            "causal_mask": MLFeatureValue(multiArray: causal),
+            "per_layer_combined": MLFeatureValue(multiArray: plc),
+            "cos_s": MLFeatureValue(multiArray: cosS),
+            "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF),
+            "sin_f": MLFeatureValue(multiArray: sinF),
+        ])
+        let out2 = try p2.prediction(from: input2)
+        let h2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
+
+        // chunk2 slot → kSliding2 mapping: [L8, L9=full, L10, L11, L12, L13=sliding, L14=full]
+        // Sliding slots: L8→0, L10→1, L11→2, L12→3, L13→4
+        // Full slots: L9→0, L14→1
+        try writeSlidingFromPrefill(src: out2, name: "K0", slotKV: ks2, slot: 0, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out2, name: "V0", slotKV: vs2, slot: 0, realLen: realLen, hd: 256)
+        try writeFullFromPrefill(src: out2, name: "K1", slotKV: kf2, slot: 0, realLen: realLen, hd: 512)
+        try writeFullFromPrefill(src: out2, name: "V1", slotKV: vf2, slot: 0, realLen: realLen, hd: 512)
+        try writeSlidingFromPrefill(src: out2, name: "K2", slotKV: ks2, slot: 1, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out2, name: "V2", slotKV: vs2, slot: 1, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out2, name: "K3", slotKV: ks2, slot: 2, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out2, name: "V3", slotKV: vs2, slot: 2, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out2, name: "K4", slotKV: ks2, slot: 3, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out2, name: "V4", slotKV: vs2, slot: 3, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out2, name: "kv13_k", slotKV: ks2, slot: 4, realLen: realLen, hd: 256)
+        try writeSlidingFromPrefill(src: out2, name: "kv13_v", slotKV: vs2, slot: 4, realLen: realLen, hd: 256)
+        try writeFullFromPrefill(src: out2, name: "kv14_k", slotKV: kf2, slot: 1, realLen: realLen, hd: 512)
+        try writeFullFromPrefill(src: out2, name: "kv14_v", slotKV: vf2, slot: 1, realLen: realLen, hd: 512)
+
+        // kv13/14 are needed as-is by chunks 3/4.
+        let kv13_k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
+        let kv13_v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
+        let kv14_k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
+        let kv14_v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
+
+        // ---- Prefill Chunk 3 (L15-24, KV-shared). ----
+        let input3 = try MLDictionaryFeatureProvider(dictionary: [
+            "hidden_states": MLFeatureValue(multiArray: h2),
+            "causal_mask": MLFeatureValue(multiArray: causal),
+            "per_layer_combined": MLFeatureValue(multiArray: plc),
+            "cos_s": MLFeatureValue(multiArray: cosS),
+            "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF),
+            "sin_f": MLFeatureValue(multiArray: sinF),
+            "kv13_k": MLFeatureValue(multiArray: kv13_k),
+            "kv13_v": MLFeatureValue(multiArray: kv13_v),
+            "kv14_k": MLFeatureValue(multiArray: kv14_k),
+            "kv14_v": MLFeatureValue(multiArray: kv14_v),
+        ])
+        let out3 = try p3.prediction(from: input3)
+        let h3 = out3.featureValue(for: "hidden_states_out")!.multiArrayValue!
+
+        // ---- Prefill Chunk 4 (L25-34 + norm + lm_head). ----
+        let input4 = try MLDictionaryFeatureProvider(dictionary: [
+            "hidden_states": MLFeatureValue(multiArray: h3),
+            "causal_mask": MLFeatureValue(multiArray: causal),
+            "per_layer_combined": MLFeatureValue(multiArray: plc),
+            "cos_s": MLFeatureValue(multiArray: cosS),
+            "sin_s": MLFeatureValue(multiArray: sinS),
+            "cos_f": MLFeatureValue(multiArray: cosF),
+            "sin_f": MLFeatureValue(multiArray: sinF),
+            "kv13_k": MLFeatureValue(multiArray: kv13_k),
+            "kv13_v": MLFeatureValue(multiArray: kv13_v),
+            "kv14_k": MLFeatureValue(multiArray: kv14_k),
+            "kv14_v": MLFeatureValue(multiArray: kv14_v),
+            "last_position_mask": MLFeatureValue(multiArray: lastMask),
+        ])
+        let out4 = try p4.prediction(from: input4)
+        let tokenID = out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
+
+        let elapsedMs = (CFAbsoluteTimeGetCurrent() - tStart) * 1000
+        print(String(format: "[Prefill] %d tokens in %.1fms (%.0f tok/s effective)",
+                     realLen, elapsedMs, Double(realLen) / (elapsedMs / 1000)))
+        return tokenID
+    }
+
+    // MARK: - Prefill helpers
+
+    /// Build (1, N, hidden) batched input: real token embeddings for [0, realLen),
+    /// zeros for the padding tail.
+    private func buildPrefillHiddenStates(tokenIDs: [Int], N: Int, embedTokens: EmbeddingLookup) throws -> MLMultiArray {
+        let arr = try MLMultiArray(shape: [1, NSNumber(value: N), NSNumber(value: hiddenSize)], dataType: .float16)
+        memset(arr.dataPointer, 0, N * hiddenSize * MemoryLayout<UInt16>.stride)
+        let dst = arr.dataPointer.bindMemory(to: UInt16.self, capacity: N * hiddenSize)
+        for (i, tid) in tokenIDs.enumerated() {
+            let emb = try embedTokens.lookup(tid, shape: [1, 1, NSNumber(value: hiddenSize)])
+            let src = emb.dataPointer.bindMemory(to: UInt16.self, capacity: hiddenSize)
+            memcpy(dst.advanced(by: i * hiddenSize), src, hiddenSize * MemoryLayout<UInt16>.stride)
+        }
+        return arr
+    }
+
+    /// Build (1, N, 35*per_layer_dim) per-token raw per-layer embedding.
+    private func buildPrefillPerLayerRaw(tokenIDs: [Int], N: Int) throws -> MLMultiArray {
+        guard let embedPerLayer else { throw NSError(domain: "LLMRunner", code: 11) }
+        let totalDim = 35 * perLayerDim
+        let arr = try MLMultiArray(shape: [1, NSNumber(value: N), NSNumber(value: totalDim)], dataType: .float16)
+        memset(arr.dataPointer, 0, N * totalDim * MemoryLayout<UInt16>.stride)
+        let dst = arr.dataPointer.bindMemory(to: UInt16.self, capacity: N * totalDim)
+        for (i, tid) in tokenIDs.enumerated() {
+            let raw = embedPerLayer.lookupRaw(tid)
+            for j in 0..<totalDim {
+                dst[i * totalDim + j] = raw[j]
+            }
+        }
+        return arr
+    }
+
+    /// (1, 1, N, N) lower-triangular causal mask (0 on/below diag, -inf above).
+    private func makePrefillCausalMask(N: Int) throws -> MLMultiArray {
+        let mask = try MLMultiArray(shape: [1, 1, NSNumber(value: N), NSNumber(value: N)], dataType: .float16)
+        let mp = mask.dataPointer.bindMemory(to: UInt16.self, capacity: N * N)
+        for i in 0..<N {
+            for j in 0..<N {
+                mp[i * N + j] = j <= i ? 0 : 0xFC00
+            }
+        }
+        return mask
+    }
+
+    /// (1, 1, N, dim) RoPE table slice for positions [0, N).
+    private func buildPrefillRoPE(table: Data?, N: Int, dim: Int) throws -> MLMultiArray {
+        let arr = try MLMultiArray(shape: [1, 1, NSNumber(value: N), NSNumber(value: dim)], dataType: .float16)
+        let dst = arr.dataPointer.bindMemory(to: UInt16.self, capacity: N * dim)
+        guard let table else {
+            memset(dst, 0, N * dim * MemoryLayout<UInt16>.stride)
+            return arr
+        }
+        // numpy .npy header
+        var headerSize = 128
+        table.withUnsafeBytes { raw in
+            let bytes = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            let hlen = Int(bytes[8]) | (Int(bytes[9]) << 8)
+            headerSize = 10 + hlen
+        }
+        let rowBytes = dim * MemoryLayout<UInt16>.stride
+        table.withUnsafeBytes { raw in
+            let base = raw.baseAddress!
+            for p in 0..<N {
+                let off = headerSize + p * rowBytes
+                if off + rowBytes <= table.count {
+                    memcpy(dst.advanced(by: p * dim), base.advanced(by: off), rowBytes)
+                } else {
+                    memset(dst.advanced(by: p * dim), 0, rowBytes)
+                }
+            }
+        }
+        return arr
+    }
+
+    /// (1, N, 1) mask with 1.0 at real last position (realLen-1), 0.0 elsewhere.
+    private func makeLastPositionMask(N: Int, realLen: Int) throws -> MLMultiArray {
+        let arr = try MLMultiArray(shape: [1, NSNumber(value: N), 1], dataType: .float16)
+        let p = arr.dataPointer.bindMemory(to: UInt16.self, capacity: N)
+        memset(p, 0, N * MemoryLayout<UInt16>.stride)
+        p[realLen - 1] = 0x3C00  // fp16 1.0
+        return arr
+    }
+
+    /// Write prefill output K or V (shape 1,1,N,hd) into a sliding cache buffer
+    /// (shape num_slots,1,W,max_hd) at positions [W-realLen, W) within `slot`.
+    private func writeSlidingFromPrefill(src out: MLFeatureProvider, name: String,
+                                          slotKV: MLMultiArray, slot: Int,
+                                          realLen: Int, hd: Int) throws {
+        guard let srcArr = out.featureValue(for: name)?.multiArrayValue else {
+            throw NSError(domain: "LLMRunner", code: 12,
+                          userInfo: [NSLocalizedDescriptionKey: "Missing prefill output \(name)"])
+        }
+        let W = slidingWindow
+        let shape = slotKV.shape.map { $0.intValue }  // (slots, 1, W, max_hd)
+        let maxHd = shape[3]
+        precondition(shape[2] == W, "slot buffer W mismatch")
+        let slotStride = 1 * W * maxHd
+        let rowStride = maxHd  // per cache position
+        let dst = slotKV.dataPointer.bindMemory(to: UInt16.self, capacity: slotKV.count)
+        let src = srcArr.dataPointer.bindMemory(to: UInt16.self, capacity: srcArr.count)
+        // src layout: (1, 1, N, hd). We copy positions [0, realLen) into slot
+        // positions [W-realLen, W) to match the decode sliding cache "newest at end" convention.
+        let startCachePos = W - realLen
+        for p in 0..<realLen {
+            let srcOff = p * hd  // (0,0,p,0) — src is (1,1,N,hd)
+            let dstOff = slot * slotStride + (startCachePos + p) * rowStride
+            // Copy hd values; remainder of maxHd is already zero.
+            for j in 0..<hd { dst[dstOff + j] = src[srcOff + j] }
+        }
+    }
+
+    /// Write prefill output K or V (shape 1,1,N,hd) into a full cache buffer
+    /// (shape num_slots,1,ctx,max_hd) at positions [0, realLen) within `slot`.
+    private func writeFullFromPrefill(src out: MLFeatureProvider, name: String,
+                                       slotKV: MLMultiArray, slot: Int,
+                                       realLen: Int, hd: Int) throws {
+        guard let srcArr = out.featureValue(for: name)?.multiArrayValue else {
+            throw NSError(domain: "LLMRunner", code: 13,
+                          userInfo: [NSLocalizedDescriptionKey: "Missing prefill output \(name)"])
+        }
+        let shape = slotKV.shape.map { $0.intValue }  // (slots, 1, ctx, max_hd)
+        let ctx = shape[2]
+        let maxHd = shape[3]
+        let slotStride = 1 * ctx * maxHd
+        let rowStride = maxHd
+        let dst = slotKV.dataPointer.bindMemory(to: UInt16.self, capacity: slotKV.count)
+        let src = srcArr.dataPointer.bindMemory(to: UInt16.self, capacity: srcArr.count)
+        for p in 0..<realLen {
+            let srcOff = p * hd
+            let dstOff = slot * slotStride + p * rowStride
+            for j in 0..<hd { dst[dstOff + j] = src[srcOff + j] }
+        }
     }
 
     /// Look up cos/sin values for a position from a numpy .npy file.
