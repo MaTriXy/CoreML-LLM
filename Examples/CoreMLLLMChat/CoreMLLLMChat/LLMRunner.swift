@@ -192,43 +192,47 @@ final class LLMRunner {
     }
 
     private func loadChunked(folder: URL, config mlConfig: MLModelConfiguration) async throws {
-        // Stateless 4-chunk lite:
+        // Stateless 4-chunk lite (SPLIT layout — separate decode/prefill mlpackages):
         // chunk1: layers 0-7 + embedding, KV cache I/O (8 slots)
         // chunk2: layers 8-14 (contains KV sources 13/14), KV cache I/O (7 slots) + kv13/14 output
         // chunk3: layers 15-24 (all shared), no KV cache, uses kv13/14
         // chunk4: layers 25-34 (all shared) + norm + lm_head, no KV cache, uses kv13/14
         //
-        // Each chunk is a multifunction mlpackage exposing two functions:
-        //   - "decode"  (seq=1 SWA, used during token-by-token generation)
-        //   - "prefill" (seq=512, used for batched prompt processing)
-        // Both functions share the same weight blob on disk and in memory.
-        let decodeCfg = MLModelConfiguration()
-        decodeCfg.computeUnits = mlConfig.computeUnits
-        decodeCfg.functionName = "decode"
-
-        let prefillCfg = MLModelConfiguration()
-        prefillCfg.computeUnits = mlConfig.computeUnits
-        prefillCfg.functionName = "prefill"
-
+        // NOTE: We previously used multifunction mlpackages (one file per chunk with
+        // both decode and prefill functions) for 50% download savings, but iPhone
+        // ANE compiler rejects the multifunction layout with:
+        //   "MIL->EIR translation: std::bad_cast"
+        // Reverting to split layout (separate mlmodelc for decode and prefill)
+        // until the multifunction iPhone compile issue is root-caused.
         loadingStatus = "Loading chunk 1/4..."
-        let url1 = findModel(in: folder, name: "chunk1")!
-        chunk1        = try MLModel(contentsOf: url1, configuration: decodeCfg)
-        prefillChunk1 = try? MLModel(contentsOf: url1, configuration: prefillCfg)
+        chunk1 = try MLModel(contentsOf: findModel(in: folder, name: "chunk1")!, configuration: mlConfig)
 
         loadingStatus = "Loading chunk 2/4..."
-        let url2 = findModel(in: folder, name: "chunk2")!
-        chunk2        = try MLModel(contentsOf: url2, configuration: decodeCfg)
-        prefillChunk2 = try? MLModel(contentsOf: url2, configuration: prefillCfg)
+        chunk2 = try MLModel(contentsOf: findModel(in: folder, name: "chunk2")!, configuration: mlConfig)
 
         loadingStatus = "Loading chunk 3/4..."
-        let url3 = findModel(in: folder, name: "chunk3")!
-        chunk3        = try MLModel(contentsOf: url3, configuration: decodeCfg)
-        prefillChunk3 = try? MLModel(contentsOf: url3, configuration: prefillCfg)
+        chunk3 = try MLModel(contentsOf: findModel(in: folder, name: "chunk3")!, configuration: mlConfig)
 
         loadingStatus = "Loading chunk 4/4..."
-        let url4 = findModel(in: folder, name: "chunk4")!
-        chunk4        = try MLModel(contentsOf: url4, configuration: decodeCfg)
-        prefillChunk4 = try? MLModel(contentsOf: url4, configuration: prefillCfg)
+        chunk4 = try MLModel(contentsOf: findModel(in: folder, name: "chunk4")!, configuration: mlConfig)
+
+        // Load prefill chunks as separate files (graceful fallback if missing).
+        if let p1 = findModel(in: folder, name: "prefill_chunk1") {
+            loadingStatus = "Loading prefill chunk 1/4..."
+            prefillChunk1 = try? MLModel(contentsOf: p1, configuration: mlConfig)
+            if let p2 = findModel(in: folder, name: "prefill_chunk2") {
+                loadingStatus = "Loading prefill chunk 2/4..."
+                prefillChunk2 = try? MLModel(contentsOf: p2, configuration: mlConfig)
+            }
+            if let p3 = findModel(in: folder, name: "prefill_chunk3") {
+                loadingStatus = "Loading prefill chunk 3/4..."
+                prefillChunk3 = try? MLModel(contentsOf: p3, configuration: mlConfig)
+            }
+            if let p4 = findModel(in: folder, name: "prefill_chunk4") {
+                loadingStatus = "Loading prefill chunk 4/4..."
+                prefillChunk4 = try? MLModel(contentsOf: p4, configuration: mlConfig)
+            }
+        }
 
         // Allocate persistent SWA KV cache buffers
         loadingStatus = "Allocating KV cache..."
