@@ -158,6 +158,19 @@ final class ModelDownloader: NSObject {
                 .init(remotePath: "hf_model/tokenizer.json", localPath: "hf_model/tokenizer.json", estimatedSize: 30_000_000),
                 .init(remotePath: "hf_model/tokenizer_config.json", localPath: "hf_model/tokenizer_config.json", estimatedSize: 5_000),
                 .init(remotePath: "hf_model/config.json", localPath: "hf_model/config.json", estimatedSize: 5_000),
+                // External embeddings
+                .init(remotePath: "embed_tokens_q8.bin", localPath: "embed_tokens_q8.bin", estimatedSize: 402_653_184),
+                .init(remotePath: "embed_tokens_scales.bin", localPath: "embed_tokens_scales.bin", estimatedSize: 524_288),
+                .init(remotePath: "embed_tokens_per_layer_q8.bin", localPath: "embed_tokens_per_layer_q8.bin", estimatedSize: 2_348_810_240),
+                .init(remotePath: "embed_tokens_per_layer_scales.bin", localPath: "embed_tokens_per_layer_scales.bin", estimatedSize: 524_288),
+                // Per-layer projection
+                .init(remotePath: "per_layer_projection.bin", localPath: "per_layer_projection.bin", estimatedSize: 27_525_120),
+                .init(remotePath: "per_layer_norm_weight.bin", localPath: "per_layer_norm_weight.bin", estimatedSize: 1_024),
+                // RoPE tables
+                .init(remotePath: "cos_sliding.npy", localPath: "cos_sliding.npy", estimatedSize: 524_416),
+                .init(remotePath: "sin_sliding.npy", localPath: "sin_sliding.npy", estimatedSize: 524_416),
+                .init(remotePath: "cos_full.npy", localPath: "cos_full.npy", estimatedSize: 1_048_704),
+                .init(remotePath: "sin_full.npy", localPath: "sin_full.npy", estimatedSize: 1_048_704),
             ]
         } else {
             // Monolithic model

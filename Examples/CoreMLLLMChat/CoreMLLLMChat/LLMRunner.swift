@@ -307,7 +307,16 @@ final class LLMRunner {
     private func predictChunked(tokenID: Int, position: Int, imageEmbedding: MLMultiArray? = nil) throws -> Int {
         guard let chunk1, let chunk2, let chunk3,
               let chunk1State, let chunk2State,
-              let embedTokens, let embedPerLayer else { throw NSError(domain: "", code: 0) }
+              let embedTokens, let embedPerLayer else {
+            var missing = [String]()
+            if self.chunk1 == nil { missing.append("chunk1") }
+            if self.chunk2 == nil { missing.append("chunk2") }
+            if self.chunk3 == nil { missing.append("chunk3") }
+            if self.embedTokens == nil { missing.append("embed_tokens") }
+            if self.embedPerLayer == nil { missing.append("embed_per_layer") }
+            throw NSError(domain: "LLMRunner", code: 0,
+                          userInfo: [NSLocalizedDescriptionKey: "Missing: \(missing.joined(separator: ", "))"])
+        }
         let ctx = contextLength, hs = hiddenSize
 
         let mask = try makeCausalMask(position: position, contextLength: ctx)
@@ -417,7 +426,11 @@ final class LLMRunner {
 
     private func computePerLayerCombined(tokenID: Int, embedding: MLMultiArray) throws -> MLMultiArray {
         guard let embedPerLayer, let perLayerProjF32 else {
-            throw NSError(domain: "LLMRunner", code: 2)
+            var missing = [String]()
+            if self.embedPerLayer == nil { missing.append("embed_per_layer") }
+            if self.perLayerProjF32 == nil { missing.append("per_layer_projection") }
+            throw NSError(domain: "LLMRunner", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "Missing files: \(missing.joined(separator: ", "))"])
         }
         let nlayers = 35, pld = perLayerDim
         let totalDim = nlayers * pld  // 8960
