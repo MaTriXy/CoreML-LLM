@@ -73,25 +73,18 @@ final class LLMRunner {
             if let es2 = json["per_layer_embed_scale"] as? Double { perLayerEmbedScale = Float(es2) }
         }
 
-        // Try ANE first, fall back to CPU+GPU if ANE compilation fails
         let mlConfig = MLModelConfiguration()
-        mlConfig.computeUnits = .all
+        #if os(iOS) || os(visionOS)
+        mlConfig.computeUnits = .cpuAndGPU  // ANE compiler rejects this model on iPhone
+        #else
+        mlConfig.computeUnits = .all        // ANE works on Mac
+        #endif
 
         let chunk1URL = findModel(in: folder, name: "chunk1")
-        do {
-            if chunk1URL != nil {
-                try await loadChunked(folder: folder, config: mlConfig)
-            } else {
-                try await loadMonolithic(url: url, folder: folder, config: mlConfig)
-            }
-        } catch {
-            loadingStatus = "ANE failed, using CPU+GPU..."
-            mlConfig.computeUnits = .cpuAndGPU
-            if chunk1URL != nil {
-                try await loadChunked(folder: folder, config: mlConfig)
-            } else {
-                try await loadMonolithic(url: url, folder: folder, config: mlConfig)
-            }
+        if chunk1URL != nil {
+            try await loadChunked(folder: folder, config: mlConfig)
+        } else {
+            try await loadMonolithic(url: url, folder: folder, config: mlConfig)
         }
 
         // Vision model
