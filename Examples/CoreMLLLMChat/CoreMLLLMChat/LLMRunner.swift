@@ -367,24 +367,25 @@ final class LLMRunner {
         // Projection: per_layer_model_projection(embedding) * scale
         // projection weight: (8960, 1536) float16
         let embPtr = embedding.dataPointer.bindMemory(to: UInt16.self, capacity: hiddenSize)
-        let projPtr = perLayerProjWeight!.withUnsafeBytes { $0.baseAddress!.assumingMemoryBound(to: UInt16.self) }
 
         // Simple matmul: result = embedding @ projWeight^T * projScale
-        // For each output dim, dot product of embedding (1536) with weight row
-        for i in 0..<totalDim {
-            var sum: Float = 0
-            let rowStart = i * hiddenSize
-            for j in 0..<hiddenSize {
-                let e = float16ToFloat(embPtr[j])
-                let w = float16ToFloat(projPtr[rowStart + j])
-                sum += e * w
-            }
-            sum *= perLayerProjScale
+        perLayerProjWeight.withUnsafeBytes { rawBuf in
+            let projPtr = rawBuf.baseAddress!.assumingMemoryBound(to: UInt16.self)
+            for i in 0..<totalDim {
+                var sum: Float = 0
+                let rowStart = i * hiddenSize
+                for j in 0..<hiddenSize {
+                    let e = float16ToFloat(embPtr[j])
+                    let w = float16ToFloat(projPtr[rowStart + j])
+                    sum += e * w
+                }
+                sum *= perLayerProjScale
 
-            // Combine: (proj + raw) * inputScale
-            let rawVal = float16ToFloat(raw[i])
-            let combined = (sum + rawVal) * perLayerInputScale
-            resultPtr[i] = floatToFloat16(combined)
+                // Combine: (proj + raw) * inputScale
+                let rawVal = float16ToFloat(raw[i])
+                let combined = (sum + rawVal) * perLayerInputScale
+                resultPtr[i] = floatToFloat16(combined)
+            }
         }
 
         return result
