@@ -3,7 +3,7 @@ import Foundation
 import Tokenizers
 
 /// Manages CoreML LLM model loading and inference.
-/// Uses the same API as the CoreMLLLM Swift Package.
+/// Supports monolithic model or chunked model (for large models on iPhone).
 @Observable
 final class LLMRunner {
     var isLoaded = false
@@ -13,14 +13,29 @@ final class LLMRunner {
     var modelName = ""
     var hasVision = false
 
+    // Monolithic model
     private var model: MLModel?
-    private var visionModel: MLModel?
     private var state: MLState?
+
+    // Chunked model (for large models that don't fit in single compilation)
+    private var chunk1: MLModel?
+    private var chunk2: MLModel?
+    private var chunk3: MLModel?
+    private var chunk1State: MLState?
+    private var chunk2State: MLState?
+    private var isChunked = false
+
+    // Vision
+    private var visionModel: MLModel?
+
+    // Shared
     private var tokenizer: (any Tokenizer)?
     private var contextLength = 512
     private var hiddenSize = 1536
     private var architecture = "gemma4"
     private var currentPosition = 0
+
+    // MARK: - Loading
 
     func loadModel(from url: URL) async throws {
         let folder = url.deletingLastPathComponent()
@@ -36,33 +51,23 @@ final class LLMRunner {
             modelName = json["model_name"] as? String ?? "Model"
         }
 
-        // Main model
         let mlConfig = MLModelConfiguration()
         mlConfig.computeUnits = .all
 
-        // Load main model (.mlmodelc = pre-compiled, .mlpackage = needs compile)
-        let modelcURL = folder.appendingPathComponent("model.mlmodelc")
-        if FileManager.default.fileExists(atPath: modelcURL.path) {
-            loadingStatus = "Loading model..."
-            model = try MLModel(contentsOf: modelcURL, configuration: mlConfig)
+        // Detect: chunked or monolithic?
+        let chunk1URL = findModel(in: folder, name: "chunk1")
+        if let c1url = chunk1URL {
+            // Chunked model
+            try await loadChunked(folder: folder, config: mlConfig)
         } else {
-            loadingStatus = "Compiling model..."
-            let compiled = try await MLModel.compileModel(at: url)
-            model = try MLModel(contentsOf: compiled, configuration: mlConfig)
+            // Monolithic model
+            try await loadMonolithic(url: url, folder: folder, config: mlConfig)
         }
-        state = model?.makeState()
 
         // Vision model
-        let visionCompiledURL = folder.appendingPathComponent("vision.mlmodelc")
-        let visionPackageURL = folder.appendingPathComponent("vision.mlpackage")
-        if FileManager.default.fileExists(atPath: visionCompiledURL.path) {
+        if let vurl = findModel(in: folder, name: "vision") {
             loadingStatus = "Loading vision..."
-            visionModel = try MLModel(contentsOf: visionCompiledURL, configuration: mlConfig)
-            hasVision = true
-        } else if FileManager.default.fileExists(atPath: visionPackageURL.path) {
-            loadingStatus = "Compiling vision..."
-            let compiledV = try await MLModel.compileModel(at: visionPackageURL)
-            visionModel = try MLModel(contentsOf: compiledV, configuration: mlConfig)
+            visionModel = try MLModel(contentsOf: vurl, configuration: mlConfig)
             hasVision = true
         }
 
@@ -76,8 +81,47 @@ final class LLMRunner {
         loadingStatus = "Ready"
     }
 
+    private func loadMonolithic(url: URL, folder: URL, config: MLModelConfiguration) async throws {
+        let modelcURL = folder.appendingPathComponent("model.mlmodelc")
+        if FileManager.default.fileExists(atPath: modelcURL.path) {
+            loadingStatus = "Loading model..."
+            model = try MLModel(contentsOf: modelcURL, configuration: config)
+        } else {
+            loadingStatus = "Compiling model..."
+            let compiled = try await MLModel.compileModel(at: url)
+            model = try MLModel(contentsOf: compiled, configuration: config)
+        }
+        state = model?.makeState()
+        isChunked = false
+    }
+
+    private func loadChunked(folder: URL, config: MLModelConfiguration) async throws {
+        loadingStatus = "Loading chunk 1/3..."
+        chunk1 = try MLModel(contentsOf: findModel(in: folder, name: "chunk1")!, configuration: config)
+        chunk1State = chunk1?.makeState()
+
+        loadingStatus = "Loading chunk 2/3..."
+        chunk2 = try MLModel(contentsOf: findModel(in: folder, name: "chunk2")!, configuration: config)
+        chunk2State = chunk2?.makeState()
+
+        loadingStatus = "Loading chunk 3/3..."
+        chunk3 = try MLModel(contentsOf: findModel(in: folder, name: "chunk3")!, configuration: config)
+
+        isChunked = true
+    }
+
+    private func findModel(in folder: URL, name: String) -> URL? {
+        let compiled = folder.appendingPathComponent("\(name).mlmodelc")
+        if FileManager.default.fileExists(atPath: compiled.path) { return compiled }
+        let pkg = folder.appendingPathComponent("\(name).mlpackage")
+        if FileManager.default.fileExists(atPath: pkg.path) { return pkg }
+        return nil
+    }
+
+    // MARK: - Generation
+
     func generate(messages: [ChatMessage], image: CGImage? = nil) async throws -> AsyncStream<String> {
-        guard model != nil, state != nil, tokenizer != nil else {
+        guard tokenizer != nil, (model != nil || chunk1 != nil) else {
             throw NSError(domain: "LLMRunner", code: 1, userInfo: [NSLocalizedDescriptionKey: "Model not loaded"])
         }
 
@@ -85,14 +129,12 @@ final class LLMRunner {
         let prompt = buildPrompt(messages: messages, hasImage: image != nil)
         let tokenIDs = tokenizer!.encode(text: prompt)
 
-        // Vision
         var imageFeatures: MLMultiArray?
         if let image, let vm = visionModel {
             imageFeatures = try processImage(image, with: vm)
         }
 
-        state = model!.makeState()
-        currentPosition = 0
+        resetConversation()
 
         return AsyncStream { continuation in
             Task {
@@ -102,19 +144,17 @@ final class LLMRunner {
                     var imageIdx = 0
                     var nextID = 0
 
-                    // Prefill
                     for (step, tid) in tokenIDs.enumerated() {
                         if tid == IMAGE_TOKEN_ID, let feats = imageFeatures, imageIdx < 256 {
                             let imgEmb = self.sliceFeature(feats, at: imageIdx)
-                            nextID = try self.predict(tokenID: 0, position: step, imageEmbedding: imgEmb)
+                            nextID = try self.predictStep(tokenID: 0, position: step, imageEmbedding: imgEmb)
                             imageIdx += 1
                         } else {
-                            nextID = try self.predict(tokenID: tid, position: step)
+                            nextID = try self.predictStep(tokenID: tid, position: step)
                         }
                         self.currentPosition = step + 1
                     }
 
-                    // Decode
                     let startTime = CFAbsoluteTimeGetCurrent()
                     var tokenCount = 0
                     let eosIDs: Set<Int> = [1, 106, 151645]
@@ -126,7 +166,7 @@ final class LLMRunner {
                         tokenCount += 1
                         let elapsed = CFAbsoluteTimeGetCurrent() - startTime
                         if elapsed > 0 { self.tokensPerSecond = Double(tokenCount) / elapsed }
-                        nextID = try self.predict(tokenID: nextID, position: self.currentPosition)
+                        nextID = try self.predictStep(tokenID: nextID, position: self.currentPosition)
                         self.currentPosition += 1
                     }
                 } catch {}
@@ -136,13 +176,28 @@ final class LLMRunner {
     }
 
     func resetConversation() {
-        state = model?.makeState()
+        if isChunked {
+            chunk1State = chunk1?.makeState()
+            chunk2State = chunk2?.makeState()
+        } else {
+            state = model?.makeState()
+        }
         currentPosition = 0
     }
 
-    // MARK: - Private
+    // MARK: - Prediction (dispatches to monolithic or chunked)
 
-    private func predict(tokenID: Int, position: Int, imageEmbedding: MLMultiArray? = nil) throws -> Int {
+    private func predictStep(tokenID: Int, position: Int, imageEmbedding: MLMultiArray? = nil) throws -> Int {
+        if isChunked {
+            return try predictChunked(tokenID: tokenID, position: position, imageEmbedding: imageEmbedding)
+        } else {
+            return try predictMonolithic(tokenID: tokenID, position: position, imageEmbedding: imageEmbedding)
+        }
+    }
+
+    // MARK: - Monolithic Prediction
+
+    private func predictMonolithic(tokenID: Int, position: Int, imageEmbedding: MLMultiArray? = nil) throws -> Int {
         guard let model, let state else { throw NSError(domain: "", code: 0) }
         let ctx = contextLength, hs = hiddenSize
 
@@ -150,13 +205,8 @@ final class LLMRunner {
         ids[[0, 0] as [NSNumber]] = NSNumber(value: Int32(tokenID))
         let pos = try MLMultiArray(shape: [1], dataType: .int32)
         pos[0] = NSNumber(value: Int32(position))
-        let mask = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: ctx)], dataType: .float16)
-        let mp = mask.dataPointer.bindMemory(to: UInt16.self, capacity: ctx)
-        for i in 0..<ctx { mp[i] = i <= position ? 0 : 0xFC00 }
-        let umask = try MLMultiArray(shape: [1, 1, NSNumber(value: ctx), 1], dataType: .float16)
-        let up = umask.dataPointer.bindMemory(to: UInt16.self, capacity: ctx)
-        memset(up, 0, ctx * MemoryLayout<UInt16>.stride)
-        up[position] = 0x3C00
+        let mask = try makeCausalMask(position: position, contextLength: ctx)
+        let umask = try makeUpdateMask(position: position, contextLength: ctx)
 
         let imgEmb: MLMultiArray
         if let imageEmbedding {
@@ -177,9 +227,111 @@ final class LLMRunner {
         return output.featureValue(for: "token_id")!.multiArrayValue![0].intValue
     }
 
+    // MARK: - Chunked Prediction
+
+    private func predictChunked(tokenID: Int, position: Int, imageEmbedding: MLMultiArray? = nil) throws -> Int {
+        guard let chunk1, let chunk2, let chunk3,
+              let chunk1State, let chunk2State else { throw NSError(domain: "", code: 0) }
+        let ctx = contextLength, hs = hiddenSize
+
+        let ids = try MLMultiArray(shape: [1, 1], dataType: .int32)
+        ids[[0, 0] as [NSNumber]] = NSNumber(value: Int32(tokenID))
+        let pos = try MLMultiArray(shape: [1], dataType: .int32)
+        pos[0] = NSNumber(value: Int32(position))
+        let mask = try makeCausalMask(position: position, contextLength: ctx)
+        let umask = try makeUpdateMask(position: position, contextLength: ctx)
+
+        let imgEmb: MLMultiArray
+        if let imageEmbedding {
+            imgEmb = imageEmbedding
+        } else {
+            imgEmb = try MLMultiArray(shape: [1, 1, NSNumber(value: hs)], dataType: .float16)
+            memset(imgEmb.dataPointer, 0, hs * MemoryLayout<UInt16>.stride)
+        }
+
+        // Chunk 1: embed + layers 0-11 → hidden_states + per_layer_combined
+        let input1 = try MLDictionaryFeatureProvider(dictionary: [
+            "input_ids": MLFeatureValue(multiArray: ids),
+            "position_ids": MLFeatureValue(multiArray: pos),
+            "causal_mask": MLFeatureValue(multiArray: mask),
+            "update_mask": MLFeatureValue(multiArray: umask),
+            "image_embedding": MLFeatureValue(multiArray: imgEmb),
+        ])
+        let out1 = try chunk1.prediction(from: input1, using: chunk1State)
+        let hiddenStates = out1.featureValue(for: "hidden_states")!.multiArrayValue!
+        let perLayerCombined = out1.featureValue(for: "per_layer_combined")!.multiArrayValue!
+
+        // Chunk 2: layers 12-23 → hidden_states (+ stores kv13/kv14 internally)
+        let input2 = try MLDictionaryFeatureProvider(dictionary: [
+            "hidden_states": MLFeatureValue(multiArray: hiddenStates),
+            "per_layer_combined": MLFeatureValue(multiArray: perLayerCombined),
+            "position_ids": MLFeatureValue(multiArray: pos),
+            "causal_mask": MLFeatureValue(multiArray: mask),
+            "update_mask": MLFeatureValue(multiArray: umask),
+        ])
+        let out2 = try chunk2.prediction(from: input2, using: chunk2State)
+        let hiddenStates2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
+
+        // Read KV13/KV14 from chunk2's KV cache state for chunk3
+        // Chunk2 stores layers 12-23: local indices 0-11
+        // Layer 13 = local 1, Layer 14 = local 2
+        // KV cache layout: [K0..K11, V0..V11] = 24 entries
+        // K13 = index 1, V13 = index 13, K14 = index 2, V14 = index 14
+        let kv13_k = try extractKVSlice(from: chunk2State, cacheIndex: 1, headDim: 256)
+        let kv13_v = try extractKVSlice(from: chunk2State, cacheIndex: 13, headDim: 256)
+        let kv14_k = try extractKVSlice(from: chunk2State, cacheIndex: 2, headDim: 512)
+        let kv14_v = try extractKVSlice(from: chunk2State, cacheIndex: 14, headDim: 512)
+
+        // Chunk 3: layers 24-34 + norm + lm_head → token_id
+        let input3 = try MLDictionaryFeatureProvider(dictionary: [
+            "hidden_states": MLFeatureValue(multiArray: hiddenStates2),
+            "per_layer_combined": MLFeatureValue(multiArray: perLayerCombined),
+            "position_ids": MLFeatureValue(multiArray: pos),
+            "causal_mask": MLFeatureValue(multiArray: mask),
+            "kv13_k": MLFeatureValue(multiArray: kv13_k),
+            "kv13_v": MLFeatureValue(multiArray: kv13_v),
+            "kv14_k": MLFeatureValue(multiArray: kv14_k),
+            "kv14_v": MLFeatureValue(multiArray: kv14_v),
+        ])
+        let out3 = try chunk3.prediction(from: input3)
+        return out3.featureValue(for: "token_id")!.multiArrayValue![0].intValue
+    }
+
+    private func extractKVSlice(from state: MLState, cacheIndex: Int, headDim: Int) throws -> MLMultiArray {
+        // Read from the KV cache state
+        // KV cache shape: (24, 1, 512, 512) — [layer, kv_heads, seq, max_head_dim]
+        // We need: (1, 1, 512, headDim)
+        let ctx = contextLength
+        let result = try MLMultiArray(shape: [1, 1, NSNumber(value: ctx), NSNumber(value: headDim)], dataType: .float16)
+
+        // Access state's buffer
+        // MLState doesn't have direct read access — the KV values are passed through chunk2's outputs
+        // TODO: chunk2 needs to output kv13/kv14 explicitly
+
+        // For now, zero-fill (this will be fixed when chunk2 outputs KV)
+        memset(result.dataPointer, 0, ctx * headDim * MemoryLayout<UInt16>.stride)
+        return result
+    }
+
+    // MARK: - Helpers
+
+    private func makeCausalMask(position: Int, contextLength: Int) throws -> MLMultiArray {
+        let mask = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: contextLength)], dataType: .float16)
+        let mp = mask.dataPointer.bindMemory(to: UInt16.self, capacity: contextLength)
+        for i in 0..<contextLength { mp[i] = i <= position ? 0 : 0xFC00 }
+        return mask
+    }
+
+    private func makeUpdateMask(position: Int, contextLength: Int) throws -> MLMultiArray {
+        let umask = try MLMultiArray(shape: [1, 1, NSNumber(value: contextLength), 1], dataType: .float16)
+        let up = umask.dataPointer.bindMemory(to: UInt16.self, capacity: contextLength)
+        memset(up, 0, contextLength * MemoryLayout<UInt16>.stride)
+        up[position] = 0x3C00
+        return umask
+    }
+
     private func processImage(_ image: CGImage, with visionModel: MLModel) throws -> MLMultiArray {
-        let ps = 16, total = 2520, pd = 768
-        let sz = 896
+        let ps = 16, total = 2520, pd = 768, sz = 896
         var pixels = [UInt8](repeating: 0, count: sz * sz * 4)
         let ctx = CGContext(data: &pixels, width: sz, height: sz, bitsPerComponent: 8,
                             bytesPerRow: sz * 4, space: CGColorSpaceCreateDeviceRGB(),
@@ -191,20 +343,17 @@ final class LLMRunner {
         let pvp = pv.dataPointer.bindMemory(to: Float.self, capacity: total * pd)
         let pidp = pid.dataPointer.bindMemory(to: Int32.self, capacity: total * 2)
 
-        var pi = 0
-        let pps = sz / ps
-        for py in 0..<pps {
-            for px in 0..<pps {
-                guard pi < total else { break }
-                var o = pi * pd
-                for dy in 0..<ps { for dx in 0..<ps {
-                    let po = ((py * ps + dy) * sz + (px * ps + dx)) * 4
-                    pvp[o] = Float(pixels[po]) / 255; pvp[o+1] = Float(pixels[po+1]) / 255; pvp[o+2] = Float(pixels[po+2]) / 255; o += 3
-                }}
-                pidp[pi * 2] = Int32(px); pidp[pi * 2 + 1] = Int32(py); pi += 1
-            }
-        }
-        for i in pi..<total { pidp[i * 2] = -1; pidp[i * 2 + 1] = -1 }
+        var pi = 0; let pps = sz / ps
+        for py in 0..<pps { for px in 0..<pps {
+            guard pi < total else { break }
+            var o = pi * pd
+            for dy in 0..<ps { for dx in 0..<ps {
+                let po = ((py * ps + dy) * sz + (px * ps + dx)) * 4
+                pvp[o] = Float(pixels[po])/255; pvp[o+1] = Float(pixels[po+1])/255; pvp[o+2] = Float(pixels[po+2])/255; o += 3
+            }}
+            pidp[pi*2] = Int32(px); pidp[pi*2+1] = Int32(py); pi += 1
+        }}
+        for i in pi..<total { pidp[i*2] = -1; pidp[i*2+1] = -1 }
 
         let input = try MLDictionaryFeatureProvider(dictionary: [
             "pixel_values": MLFeatureValue(multiArray: pv),

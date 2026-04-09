@@ -28,6 +28,9 @@ final class ModelDownloader: NSObject {
             ModelInfo(id: "gemma4-e2b", name: "Gemma 4 E2B (Multimodal)", size: "2.7 GB",
                       downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml/resolve/main",
                       folderName: "gemma4-e2b"),
+            ModelInfo(id: "gemma4-e2b-chunked", name: "Gemma 4 E2B Chunked (iPhone)", size: "2.7 GB",
+                      downloadURL: "https://huggingface.co/mlboydaisuke/gemma-4-E2B-coreml/resolve/main",
+                      folderName: "gemma4-e2b-chunked"),
             ModelInfo(id: "qwen2.5-0.5b", name: "Qwen2.5 0.5B (Text)", size: "309 MB",
                       downloadURL: "https://github.com/john-rocky/CoreML-LLM/releases/download/v0.1.0/qwen2.5-0.5b-coreml.zip",
                       folderName: "qwen2.5-0.5b"),
@@ -57,7 +60,12 @@ final class ModelDownloader: NSObject {
 
     func localModelURL(for model: ModelInfo) -> URL? {
         let dir = modelsDirectory.appendingPathComponent(model.folderName)
-        // .mlmodelc
+        // Chunked
+        let chunk1 = dir.appendingPathComponent("chunk1.mlmodelc")
+        if fileManager.fileExists(atPath: chunk1.appendingPathComponent("weights/weight.bin").path) {
+            return chunk1
+        }
+        // Monolithic .mlmodelc
         let modelc = dir.appendingPathComponent("model.mlmodelc")
         if fileManager.fileExists(atPath: modelc.appendingPathComponent("weights/weight.bin").path) {
             return modelc
@@ -124,15 +132,41 @@ final class ModelDownloader: NSObject {
     private func downloadFromHuggingFace(_ model: ModelInfo, to destDir: URL) async throws {
         let base = model.downloadURL
 
-        var files: [DownloadFile] = [
-            .init(remotePath: "model.mlmodelc/weights/weight.bin", localPath: "model.mlmodelc/weights/weight.bin", estimatedSize: 2_500_000_000),
-            .init(remotePath: "model.mlmodelc/coremldata.bin", localPath: "model.mlmodelc/coremldata.bin", estimatedSize: 500_000),
-            .init(remotePath: "model.mlmodelc/model.mil", localPath: "model.mlmodelc/model.mil", estimatedSize: 100_000),
-            .init(remotePath: "model.mlmodelc/metadata.json", localPath: "model.mlmodelc/metadata.json", estimatedSize: 1_000),
-            .init(remotePath: "model.mlmodelc/analytics/coremldata.bin", localPath: "model.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
-            .init(remotePath: "model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
-            .init(remotePath: "hf_model/tokenizer.json", localPath: "hf_model/tokenizer.json", estimatedSize: 30_000_000),
-        ]
+        var files: [DownloadFile]
+
+        if model.id.contains("chunked") {
+            // Chunked model for iPhone
+            files = [
+                .init(remotePath: "chunk1.mlmodelc/weights/weight.bin", localPath: "chunk1.mlmodelc/weights/weight.bin", estimatedSize: 1_535_000_000),
+                .init(remotePath: "chunk1.mlmodelc/coremldata.bin", localPath: "chunk1.mlmodelc/coremldata.bin", estimatedSize: 500_000),
+                .init(remotePath: "chunk1.mlmodelc/model.mil", localPath: "chunk1.mlmodelc/model.mil", estimatedSize: 100_000),
+                .init(remotePath: "chunk1.mlmodelc/metadata.json", localPath: "chunk1.mlmodelc/metadata.json", estimatedSize: 1_000),
+                .init(remotePath: "chunk1.mlmodelc/analytics/coremldata.bin", localPath: "chunk1.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
+                .init(remotePath: "chunk2.mlmodelc/weights/weight.bin", localPath: "chunk2.mlmodelc/weights/weight.bin", estimatedSize: 333_000_000),
+                .init(remotePath: "chunk2.mlmodelc/coremldata.bin", localPath: "chunk2.mlmodelc/coremldata.bin", estimatedSize: 500_000),
+                .init(remotePath: "chunk2.mlmodelc/model.mil", localPath: "chunk2.mlmodelc/model.mil", estimatedSize: 100_000),
+                .init(remotePath: "chunk2.mlmodelc/metadata.json", localPath: "chunk2.mlmodelc/metadata.json", estimatedSize: 1_000),
+                .init(remotePath: "chunk2.mlmodelc/analytics/coremldata.bin", localPath: "chunk2.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
+                .init(remotePath: "chunk3.mlmodelc/weights/weight.bin", localPath: "chunk3.mlmodelc/weights/weight.bin", estimatedSize: 537_000_000),
+                .init(remotePath: "chunk3.mlmodelc/coremldata.bin", localPath: "chunk3.mlmodelc/coremldata.bin", estimatedSize: 500_000),
+                .init(remotePath: "chunk3.mlmodelc/model.mil", localPath: "chunk3.mlmodelc/model.mil", estimatedSize: 100_000),
+                .init(remotePath: "chunk3.mlmodelc/metadata.json", localPath: "chunk3.mlmodelc/metadata.json", estimatedSize: 1_000),
+                .init(remotePath: "chunk3.mlmodelc/analytics/coremldata.bin", localPath: "chunk3.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
+                .init(remotePath: "model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
+                .init(remotePath: "hf_model/tokenizer.json", localPath: "hf_model/tokenizer.json", estimatedSize: 30_000_000),
+            ]
+        } else {
+            // Monolithic model
+            files = [
+                .init(remotePath: "model.mlmodelc/weights/weight.bin", localPath: "model.mlmodelc/weights/weight.bin", estimatedSize: 2_500_000_000),
+                .init(remotePath: "model.mlmodelc/coremldata.bin", localPath: "model.mlmodelc/coremldata.bin", estimatedSize: 500_000),
+                .init(remotePath: "model.mlmodelc/model.mil", localPath: "model.mlmodelc/model.mil", estimatedSize: 100_000),
+                .init(remotePath: "model.mlmodelc/metadata.json", localPath: "model.mlmodelc/metadata.json", estimatedSize: 1_000),
+                .init(remotePath: "model.mlmodelc/analytics/coremldata.bin", localPath: "model.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
+                .init(remotePath: "model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
+                .init(remotePath: "hf_model/tokenizer.json", localPath: "hf_model/tokenizer.json", estimatedSize: 30_000_000),
+            ]
+        }
 
         if model.id.contains("gemma") {
             files += [
