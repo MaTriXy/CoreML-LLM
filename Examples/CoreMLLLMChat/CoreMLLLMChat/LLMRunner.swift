@@ -526,10 +526,8 @@ final class LLMRunner {
             hiddenIn = textEmb
         }
         let t1 = CFAbsoluteTimeGetCurrent()
-        // PLE projection uses the ACTUAL hidden state (image or text), matching
-        // the original monolithic model behavior. Raw per-layer lookup still uses
-        // tokenID (PAD=0 for image positions).
-        let plc = try computePerLayerCombined(tokenID: tokenID, embedding: hiddenIn)
+        // PLE: lookup raw only. Projection done inside chunk1 on ANE.
+        let plRaw = try lookupPerLayerRaw(tokenID: tokenID)
         let t2 = CFAbsoluteTimeGetCurrent()
         profileEmbed += (t1 - t0)
         profilePLE += (t2 - t1)
@@ -545,13 +543,13 @@ final class LLMRunner {
 
         let tp = CFAbsoluteTimeGetCurrent()
 
-        // ---- Chunk 1: 7 sliding + 1 full KV ----
+        // ---- Chunk 1: 7 sliding + 1 full KV. Computes PLE inside (ANE matmul). ----
         let input1 = try MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: hiddenIn),
             "causal_mask_full": MLFeatureValue(multiArray: maskFull),
             "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
             "update_mask": MLFeatureValue(multiArray: umask),
-            "per_layer_combined": MLFeatureValue(multiArray: plc),
+            "per_layer_raw": MLFeatureValue(multiArray: plRaw),
             "cos_s": MLFeatureValue(multiArray: cosS),
             "sin_s": MLFeatureValue(multiArray: sinS),
             "cos_f": MLFeatureValue(multiArray: cosF),
@@ -563,6 +561,7 @@ final class LLMRunner {
         ])
         let out1 = try chunk1.prediction(from: input1)
         let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
+        let plc = out1.featureValue(for: "per_layer_combined_out")!.multiArrayValue!  // chunk1 computes PLC
         let newKs1 = out1.featureValue(for: "K_sliding_out")!.multiArrayValue!
         let newVs1 = out1.featureValue(for: "V_sliding_out")!.multiArrayValue!
         let newKf1 = out1.featureValue(for: "K_full_out")!.multiArrayValue!
@@ -774,6 +773,18 @@ final class LLMRunner {
         let mp = mask.dataPointer.bindMemory(to: UInt16.self, capacity: contextLength)
         for i in 0..<contextLength { mp[i] = i <= position ? 0 : 0xFC00 }
         return mask
+    }
+
+    /// Lookup per-layer raw embedding (already scaled by per_layer_embed_scale).
+    /// Shape: (1, 1, num_layers * per_layer_dim).
+    private func lookupPerLayerRaw(tokenID: Int) throws -> MLMultiArray {
+        guard let embedPerLayer else { throw NSError(domain: "LLMRunner", code: 5) }
+        let totalDim = 35 * perLayerDim
+        let result = try MLMultiArray(shape: [1, 1, NSNumber(value: totalDim)], dataType: .float16)
+        let raw = embedPerLayer.lookupRaw(tokenID)
+        let dst = result.dataPointer.bindMemory(to: UInt16.self, capacity: totalDim)
+        for i in 0..<totalDim { dst[i] = raw[i] }
+        return result
     }
 
     /// Sliding window causal mask: shape (1, 1, 1, W).

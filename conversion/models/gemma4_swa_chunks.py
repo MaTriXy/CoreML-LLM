@@ -198,7 +198,9 @@ def _layer_kv_map(start: int, end: int, config):
 
 
 class SWAChunk1(nn.Module):
-    """Layers 0-7: 7 sliding (L0-3, L5-7) + 1 full (L4). Own KV cache."""
+    """Layers 0-7: 7 sliding (L0-3, L5-7) + 1 full (L4). Own KV cache.
+    Computes PLE (per_layer_combined) internally from per_layer_raw input.
+    """
     START, END = 0, 8
 
     def __init__(self, model: Gemma4Model):
@@ -208,11 +210,43 @@ class SWAChunk1(nn.Module):
         self.sliding_map, self.full_map = _layer_kv_map(self.START, self.END, model.config)
         self.num_sliding = len(self.sliding_map)  # 7
         self.num_full = len(self.full_map)  # 1
+        # PLE computation modules (moved from Swift → ANE)
+        self.per_layer_model_projection = model.per_layer_model_projection
+        self.per_layer_projection_norm = model.per_layer_projection_norm
+        self.per_layer_model_projection_scale = model.per_layer_model_projection_scale
+        self.per_layer_input_scale = model.per_layer_input_scale
+        self.per_layer_dim = model.config.hidden_size_per_layer_input
+        self.num_layers_total = model.config.num_hidden_layers
+
+    def _compute_ple(self, hidden_states, per_layer_raw):
+        """Compute per_layer_combined from hidden_states and raw per-layer embedding.
+
+        hidden_states: (1, 1, hidden)
+        per_layer_raw: (1, 1, num_layers * per_layer_dim) — already scaled by per_layer_embed_scale
+        Returns: (1, 1, num_layers * per_layer_dim)
+        """
+        # Conv2d layout: (1, 1, hidden) → (1, hidden, 1, 1)
+        h_conv = hidden_states.permute(0, 2, 1).unsqueeze(2).to(MODEL_DTYPE)
+        # Project: (1, hidden, 1, 1) → (1, total_pld, 1, 1)
+        proj = self.per_layer_model_projection(h_conv) * self.per_layer_model_projection_scale
+        # Back to (1, 1, total_pld)
+        proj = proj.squeeze(2).permute(0, 2, 1)
+        # RMSNorm per layer slice (each slice is per_layer_dim long)
+        normed_slices = []
+        for li in range(self.num_layers_total):
+            s = li * self.per_layer_dim
+            e = s + self.per_layer_dim
+            normed_slices.append(self.per_layer_projection_norm(proj[:, :, s:e]))
+        proj_normed = torch.cat(normed_slices, dim=-1)
+        # Combine: (normed_proj + raw) * input_scale
+        return (proj_normed + per_layer_raw) * self.per_layer_input_scale
 
     def forward(self, hidden_states, causal_mask_full, causal_mask_sliding, update_mask,
-                per_layer_combined, cos_s, sin_s, cos_f, sin_f,
+                per_layer_raw, cos_s, sin_s, cos_f, sin_f,
                 K_sliding_in, V_sliding_in, K_full_in, V_full_in):
         config = self.config
+        # Compute PLE internally (8ms savings vs Swift BLAS)
+        per_layer_combined = self._compute_ple(hidden_states, per_layer_raw)
         dummy_13_k = torch.zeros(1, 1, 1, 256, dtype=MODEL_DTYPE)
         dummy_13_v = torch.zeros(1, 1, 1, 256, dtype=MODEL_DTYPE)
         dummy_14_k = torch.zeros(1, 1, 1, 512, dtype=MODEL_DTYPE)
@@ -258,7 +292,8 @@ class SWAChunk1(nn.Module):
         V_sliding_out = torch.stack(V_sliding_outs, dim=0)
         K_full_out = torch.stack(K_full_outs, dim=0)
         V_full_out = torch.stack(V_full_outs, dim=0)
-        return hidden_states, K_sliding_out, V_sliding_out, K_full_out, V_full_out
+        # Return per_layer_combined as output → passed to chunks 2-4
+        return hidden_states, K_sliding_out, V_sliding_out, K_full_out, V_full_out, per_layer_combined
 
 
 class SWAChunk2(nn.Module):
