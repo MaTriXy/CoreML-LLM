@@ -18,19 +18,24 @@ final class LLMRunner {
     private var model: MLModel?
     private var state: MLState?
 
-    // Chunked model (stateless 4-chunk lite, ANE-optimized)
+    // Chunked model (SWA 4-chunk, ANE-optimized)
     private var chunk1: MLModel?
     private var chunk2: MLModel?
     private var chunk3: MLModel?
     private var chunk4: MLModel?
-    private var chunk1State: MLState?  // unused in stateless mode
-    private var chunk2State: MLState?  // unused in stateless mode
+    private var chunk1State: MLState?  // unused
+    private var chunk2State: MLState?  // unused
     private var isChunked = false
-    // Persistent KV cache buffers for stateless chunks (zero-copy across calls)
-    private var statelessKV1_K: MLMultiArray?  // (8, 1, ctx, max_hd)
-    private var statelessKV1_V: MLMultiArray?
-    private var statelessKV2_K: MLMultiArray?  // (7, 1, ctx, max_hd)
-    private var statelessKV2_V: MLMultiArray?
+    // SWA KV buffers: separate sliding (W=512) and full (ctx) per chunk
+    private var kSliding1: MLMultiArray?  // (7, 1, W, max_hd)
+    private var vSliding1: MLMultiArray?
+    private var kFull1: MLMultiArray?     // (1, 1, ctx, max_hd)
+    private var vFull1: MLMultiArray?
+    private var kSliding2: MLMultiArray?  // (5, 1, W, max_hd)
+    private var vSliding2: MLMultiArray?
+    private var kFull2: MLMultiArray?     // (2, 1, ctx, max_hd)
+    private var vFull2: MLMultiArray?
+    private var slidingWindow = 512
 
     // Vision (lazy-loaded to save memory)
     private var visionModel: MLModel?
@@ -88,6 +93,7 @@ final class LLMRunner {
             if let ps = json["per_layer_model_projection_scale"] as? Double { perLayerProjScale = Float(ps) }
             if let is_ = json["per_layer_input_scale"] as? Double { perLayerInputScale = Float(is_) }
             if let es2 = json["per_layer_embed_scale"] as? Double { perLayerEmbedScale = Float(es2) }
+            if let sw = json["sliding_window"] as? Int { slidingWindow = sw }
         }
 
         let mlConfig = MLModelConfiguration()
@@ -194,10 +200,9 @@ final class LLMRunner {
         loadingStatus = "Loading chunk 4/4..."
         chunk4 = try MLModel(contentsOf: findModel(in: folder, name: "chunk4")!, configuration: mlConfig)
 
-        // Allocate persistent KV cache buffers (zero-filled)
+        // Allocate persistent SWA KV cache buffers
         loadingStatus = "Allocating KV cache..."
-        let maxHd = 512  // global_head_dim
-        try allocateStatelessKV(maxHd: maxHd)
+        try allocateSWAKV(maxHd: 512)
 
         // Load external embeddings
         loadingStatus = "Loading external embeddings..."
@@ -244,21 +249,28 @@ final class LLMRunner {
         isChunked = true
     }
 
-    /// Allocate zero-filled KV cache buffers for stateless chunks.
-    private func allocateStatelessKV(maxHd: Int) throws {
+    /// Allocate SWA KV buffers: separate sliding (W=512) and full (ctx) caches.
+    private func allocateSWAKV(maxHd: Int) throws {
         let ctx = contextLength
-        func zeros(_ slots: Int) throws -> MLMultiArray {
+        let W = slidingWindow
+        func zeros(slots: Int, seqLen: Int) throws -> MLMultiArray {
             let arr = try MLMultiArray(
-                shape: [NSNumber(value: slots), 1, NSNumber(value: ctx), NSNumber(value: maxHd)],
+                shape: [NSNumber(value: slots), 1, NSNumber(value: seqLen), NSNumber(value: maxHd)],
                 dataType: .float16
             )
-            memset(arr.dataPointer, 0, slots * ctx * maxHd * MemoryLayout<UInt16>.stride)
+            memset(arr.dataPointer, 0, slots * seqLen * maxHd * MemoryLayout<UInt16>.stride)
             return arr
         }
-        statelessKV1_K = try zeros(8)  // chunk1: 8 layers
-        statelessKV1_V = try zeros(8)
-        statelessKV2_K = try zeros(7)  // chunk2: 7 layers
-        statelessKV2_V = try zeros(7)
+        // Chunk1: 7 sliding + 1 full
+        kSliding1 = try zeros(slots: 7, seqLen: W)
+        vSliding1 = try zeros(slots: 7, seqLen: W)
+        kFull1 = try zeros(slots: 1, seqLen: ctx)
+        vFull1 = try zeros(slots: 1, seqLen: ctx)
+        // Chunk2: 5 sliding + 2 full
+        kSliding2 = try zeros(slots: 5, seqLen: W)
+        vSliding2 = try zeros(slots: 5, seqLen: W)
+        kFull2 = try zeros(slots: 2, seqLen: ctx)
+        vFull2 = try zeros(slots: 2, seqLen: ctx)
     }
 
     /// Run a dummy prediction to force model compilation and catch ANE errors early.
@@ -386,11 +398,12 @@ final class LLMRunner {
 
     func resetConversation() {
         if isChunked {
-            // Zero out persistent KV cache buffers
-            if let k1 = statelessKV1_K { memset(k1.dataPointer, 0, k1.count * MemoryLayout<UInt16>.stride) }
-            if let v1 = statelessKV1_V { memset(v1.dataPointer, 0, v1.count * MemoryLayout<UInt16>.stride) }
-            if let k2 = statelessKV2_K { memset(k2.dataPointer, 0, k2.count * MemoryLayout<UInt16>.stride) }
-            if let v2 = statelessKV2_V { memset(v2.dataPointer, 0, v2.count * MemoryLayout<UInt16>.stride) }
+            // Zero all SWA buffers
+            for buf in [kSliding1, vSliding1, kFull1, vFull1, kSliding2, vSliding2, kFull2, vFull2] {
+                if let b = buf {
+                    memset(b.dataPointer, 0, b.count * MemoryLayout<UInt16>.stride)
+                }
+            }
         } else {
             state = model?.makeState()
         }
@@ -478,27 +491,30 @@ final class LLMRunner {
     // MARK: - Chunked Prediction
 
     private func predictChunked(tokenID: Int, position: Int, imageEmbedding: MLMultiArray? = nil) throws -> Int {
-        // Stateless 4-chunk lite architecture:
-        // chunk1: layers 0-7 + embedding, explicit KV I/O (8 slots)
-        // chunk2: layers 8-14 (KV sources 13/14), explicit KV I/O (7 slots), outputs kv13/14
-        // chunk3: layers 15-24 (all shared), no KV cache, takes kv13/14
-        // chunk4: layers 25-34 (all shared) + norm + lm_head, takes kv13/14
+        // SWA 4-chunk architecture:
+        // chunk1: layers 0-7 (7 sliding + 1 full), explicit KV I/O for both types
+        // chunk2: layers 8-14 (5 sliding + 2 full), outputs kv13 (W-sized) kv14 (ctx-sized)
+        // chunk3: layers 15-24 (all shared), reads kv13/kv14
+        // chunk4: layers 25-34 (all shared) + norm + lm_head
         guard let chunk1, let chunk2, let chunk3, let chunk4,
               let embedTokens,
-              let k1 = statelessKV1_K, let v1 = statelessKV1_V,
-              let k2 = statelessKV2_K, let v2 = statelessKV2_V else {
+              let ks1 = kSliding1, let vs1 = vSliding1,
+              let kf1 = kFull1, let vf1 = vFull1,
+              let ks2 = kSliding2, let vs2 = vSliding2,
+              let kf2 = kFull2, let vf2 = vFull2 else {
             var missing = [String]()
             if self.chunk1 == nil { missing.append("chunk1") }
             if self.chunk2 == nil { missing.append("chunk2") }
             if self.chunk3 == nil { missing.append("chunk3") }
             if self.chunk4 == nil { missing.append("chunk4") }
             if self.embedTokens == nil { missing.append("embed_tokens") }
-            if self.statelessKV1_K == nil { missing.append("KV1") }
-            if self.statelessKV2_K == nil { missing.append("KV2") }
+            if self.kSliding1 == nil { missing.append("KV1") }
+            if self.kSliding2 == nil { missing.append("KV2") }
             throw NSError(domain: "LLMRunner", code: 0,
                           userInfo: [NSLocalizedDescriptionKey: "Missing: \(missing.joined(separator: ", "))"])
         }
         let ctx = contextLength
+        let W = slidingWindow
 
         let t0 = CFAbsoluteTimeGetCurrent()
         // External embedding (text by default). Image tokens: use imageEmbedding.
@@ -518,10 +534,10 @@ final class LLMRunner {
         profileEmbed += (t1 - t0)
         profilePLE += (t2 - t1)
 
-        let mask = try makeCausalMask(position: position, contextLength: ctx)
+        let maskFull = try makeCausalMask(position: position, contextLength: ctx)
+        let maskSliding = try makeSlidingCausalMask(position: position, W: W)
         let umask = try makeUpdateMask(position: position, contextLength: ctx)
 
-        // Pre-computed RoPE for this position (from npy tables)
         let cosS = try lookupRoPE(table: cosSlidingTable, position: position, dim: 256)
         let sinS = try lookupRoPE(table: sinSlidingTable, position: position, dim: 256)
         let cosF = try lookupRoPE(table: cosFullTable, position: position, dim: 512)
@@ -529,54 +545,69 @@ final class LLMRunner {
 
         let tp = CFAbsoluteTimeGetCurrent()
 
-        // ---- Chunk 1: layers 0-7 ----
+        // ---- Chunk 1: 7 sliding + 1 full KV ----
         let input1 = try MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: hiddenIn),
-            "causal_mask": MLFeatureValue(multiArray: mask),
+            "causal_mask_full": MLFeatureValue(multiArray: maskFull),
+            "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
             "update_mask": MLFeatureValue(multiArray: umask),
             "per_layer_combined": MLFeatureValue(multiArray: plc),
             "cos_s": MLFeatureValue(multiArray: cosS),
             "sin_s": MLFeatureValue(multiArray: sinS),
             "cos_f": MLFeatureValue(multiArray: cosF),
             "sin_f": MLFeatureValue(multiArray: sinF),
-            "K_in": MLFeatureValue(multiArray: k1),
-            "V_in": MLFeatureValue(multiArray: v1),
+            "K_sliding_in": MLFeatureValue(multiArray: ks1),
+            "V_sliding_in": MLFeatureValue(multiArray: vs1),
+            "K_full_in": MLFeatureValue(multiArray: kf1),
+            "V_full_in": MLFeatureValue(multiArray: vf1),
         ])
         let out1 = try chunk1.prediction(from: input1)
         let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
-        let newK1 = out1.featureValue(for: "K_out")!.multiArrayValue!
-        let newV1 = out1.featureValue(for: "V_out")!.multiArrayValue!
-        memcpy(k1.dataPointer, newK1.dataPointer, k1.count * MemoryLayout<UInt16>.stride)
-        memcpy(v1.dataPointer, newV1.dataPointer, v1.count * MemoryLayout<UInt16>.stride)
+        let newKs1 = out1.featureValue(for: "K_sliding_out")!.multiArrayValue!
+        let newVs1 = out1.featureValue(for: "V_sliding_out")!.multiArrayValue!
+        let newKf1 = out1.featureValue(for: "K_full_out")!.multiArrayValue!
+        let newVf1 = out1.featureValue(for: "V_full_out")!.multiArrayValue!
+        memcpy(ks1.dataPointer, newKs1.dataPointer, ks1.count * MemoryLayout<UInt16>.stride)
+        memcpy(vs1.dataPointer, newVs1.dataPointer, vs1.count * MemoryLayout<UInt16>.stride)
+        memcpy(kf1.dataPointer, newKf1.dataPointer, kf1.count * MemoryLayout<UInt16>.stride)
+        memcpy(vf1.dataPointer, newVf1.dataPointer, vf1.count * MemoryLayout<UInt16>.stride)
 
-        // ---- Chunk 2: layers 8-14, emits kv13/14 ----
+        // ---- Chunk 2: 5 sliding + 2 full KV, emits kv13/14 ----
         let input2 = try MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: h1),
-            "causal_mask": MLFeatureValue(multiArray: mask),
+            "causal_mask_full": MLFeatureValue(multiArray: maskFull),
+            "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
             "update_mask": MLFeatureValue(multiArray: umask),
             "per_layer_combined": MLFeatureValue(multiArray: plc),
             "cos_s": MLFeatureValue(multiArray: cosS),
             "sin_s": MLFeatureValue(multiArray: sinS),
             "cos_f": MLFeatureValue(multiArray: cosF),
             "sin_f": MLFeatureValue(multiArray: sinF),
-            "K_in": MLFeatureValue(multiArray: k2),
-            "V_in": MLFeatureValue(multiArray: v2),
+            "K_sliding_in": MLFeatureValue(multiArray: ks2),
+            "V_sliding_in": MLFeatureValue(multiArray: vs2),
+            "K_full_in": MLFeatureValue(multiArray: kf2),
+            "V_full_in": MLFeatureValue(multiArray: vf2),
         ])
         let out2 = try chunk2.prediction(from: input2)
         let h2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
-        let newK2 = out2.featureValue(for: "K_out")!.multiArrayValue!
-        let newV2 = out2.featureValue(for: "V_out")!.multiArrayValue!
-        memcpy(k2.dataPointer, newK2.dataPointer, k2.count * MemoryLayout<UInt16>.stride)
-        memcpy(v2.dataPointer, newV2.dataPointer, v2.count * MemoryLayout<UInt16>.stride)
+        let newKs2 = out2.featureValue(for: "K_sliding_out")!.multiArrayValue!
+        let newVs2 = out2.featureValue(for: "V_sliding_out")!.multiArrayValue!
+        let newKf2 = out2.featureValue(for: "K_full_out")!.multiArrayValue!
+        let newVf2 = out2.featureValue(for: "V_full_out")!.multiArrayValue!
+        memcpy(ks2.dataPointer, newKs2.dataPointer, ks2.count * MemoryLayout<UInt16>.stride)
+        memcpy(vs2.dataPointer, newVs2.dataPointer, vs2.count * MemoryLayout<UInt16>.stride)
+        memcpy(kf2.dataPointer, newKf2.dataPointer, kf2.count * MemoryLayout<UInt16>.stride)
+        memcpy(vf2.dataPointer, newVf2.dataPointer, vf2.count * MemoryLayout<UInt16>.stride)
         let kv13_k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
         let kv13_v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
         let kv14_k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
         let kv14_v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
 
-        // ---- Chunk 3: layers 15-24 (shared KV) ----
+        // ---- Chunk 3: shared KV, reads kv13 (W-sized) and kv14 (ctx) ----
         let input3 = try MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: h2),
-            "causal_mask": MLFeatureValue(multiArray: mask),
+            "causal_mask_full": MLFeatureValue(multiArray: maskFull),
+            "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
             "update_mask": MLFeatureValue(multiArray: umask),
             "per_layer_combined": MLFeatureValue(multiArray: plc),
             "cos_s": MLFeatureValue(multiArray: cosS),
@@ -591,10 +622,11 @@ final class LLMRunner {
         let out3 = try chunk3.prediction(from: input3)
         let h3 = out3.featureValue(for: "hidden_states_out")!.multiArrayValue!
 
-        // ---- Chunk 4: layers 25-34 + norm + lm_head ----
+        // ---- Chunk 4: shared KV + norm + lm_head ----
         let input4 = try MLDictionaryFeatureProvider(dictionary: [
             "hidden_states": MLFeatureValue(multiArray: h3),
-            "causal_mask": MLFeatureValue(multiArray: mask),
+            "causal_mask_full": MLFeatureValue(multiArray: maskFull),
+            "causal_mask_sliding": MLFeatureValue(multiArray: maskSliding),
             "update_mask": MLFeatureValue(multiArray: umask),
             "per_layer_combined": MLFeatureValue(multiArray: plc),
             "cos_s": MLFeatureValue(multiArray: cosS),
@@ -741,6 +773,17 @@ final class LLMRunner {
         let mask = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: contextLength)], dataType: .float16)
         let mp = mask.dataPointer.bindMemory(to: UInt16.self, capacity: contextLength)
         for i in 0..<contextLength { mp[i] = i <= position ? 0 : 0xFC00 }
+        return mask
+    }
+
+    /// Sliding window causal mask: shape (1, 1, 1, W).
+    /// Last min(position+1, W) slots are valid (cache end holds newest).
+    private func makeSlidingCausalMask(position: Int, W: Int) throws -> MLMultiArray {
+        let mask = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: W)], dataType: .float16)
+        let mp = mask.dataPointer.bindMemory(to: UInt16.self, capacity: W)
+        let valid = min(position + 1, W)
+        let start = W - valid
+        for i in 0..<W { mp[i] = i >= start ? 0 : 0xFC00 }
         return mask
     }
 
