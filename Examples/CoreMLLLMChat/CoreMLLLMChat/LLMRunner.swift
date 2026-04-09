@@ -1,3 +1,4 @@
+import Accelerate
 import CoreML
 import Foundation
 import Tokenizers
@@ -32,6 +33,7 @@ final class LLMRunner {
     private var embedTokens: EmbeddingLookup?
     private var embedPerLayer: EmbeddingLookup?
     private var perLayerProjWeight: Data?  // (8960, 1536) float16
+    private var perLayerProjF32: [Float]? // (8960, 1536) float32 for Accelerate
     private var perLayerNormWeight: Data?  // (256,) float32
 
     // Pre-computed RoPE tables (for chunked model)
@@ -148,6 +150,22 @@ final class LLMRunner {
 
         perLayerProjWeight = try? Data(contentsOf: folder.appendingPathComponent("per_layer_projection.bin"), options: .mappedIfSafe)
         perLayerNormWeight = try? Data(contentsOf: folder.appendingPathComponent("per_layer_norm_weight.bin"), options: .mappedIfSafe)
+
+        // Pre-convert projection to float32 for Accelerate BLAS
+        if let projData = perLayerProjWeight {
+            loadingStatus = "Converting projection..."
+            let count = nlayers * perLayerDim * hiddenSize  // 8960 * 1536
+            var f32 = [Float](repeating: 0, count: count)
+            projData.withUnsafeBytes { raw in
+                let f16Ptr = raw.baseAddress!.assumingMemoryBound(to: UInt16.self)
+                var f16Buf = [Float16](repeating: 0, count: count)
+                for i in 0..<count { f16Buf[i] = Float16(bitPattern: f16Ptr[i]) }
+                var f32Buf = [Float](repeating: 0, count: count)
+                vDSP.convertElements(of: f16Buf, to: &f32Buf)
+                f32 = f32Buf
+            }
+            perLayerProjF32 = f32
+        }
 
         // RoPE tables (numpy .npy files → raw float16 data, skip 128-byte npy header)
         loadingStatus = "Loading RoPE tables..."
@@ -390,7 +408,7 @@ final class LLMRunner {
     // MARK: - Per-Layer Computation
 
     private func computePerLayerCombined(tokenID: Int, embedding: MLMultiArray) throws -> MLMultiArray {
-        guard let embedPerLayer, let perLayerProjWeight else {
+        guard let embedPerLayer, let perLayerProjF32 else {
             throw NSError(domain: "LLMRunner", code: 2)
         }
         let nlayers = 35, pld = perLayerDim
@@ -401,39 +419,34 @@ final class LLMRunner {
         // Raw per-layer embedding
         let raw = embedPerLayer.lookupRaw(tokenID)
 
-        // Projection: per_layer_model_projection(embedding) * scale
-        // projection weight: (8960, 1536) float16
+        // Convert embedding to float32
         let embPtr = embedding.dataPointer.bindMemory(to: UInt16.self, capacity: hiddenSize)
+        var embF32 = [Float](repeating: 0, count: hiddenSize)
+        var embF16 = [Float16](repeating: 0, count: hiddenSize)
+        for i in 0..<hiddenSize { embF16[i] = Float16(bitPattern: embPtr[i]) }
+        vDSP.convertElements(of: embF16, to: &embF32)
 
-        // Step 1: Compute projection = embedding @ projWeight^T * projScale
+        // Step 1: Matrix-vector multiply using Accelerate BLAS
+        // proj = projWeight (8960×1536) × embedding (1536) × projScale
         var proj = [Float](repeating: 0, count: totalDim)
-        perLayerProjWeight.withUnsafeBytes { rawBuf in
-            let projWPtr = rawBuf.baseAddress!.assumingMemoryBound(to: UInt16.self)
-            for i in 0..<totalDim {
-                var sum: Float = 0
-                let rowStart = i * hiddenSize
-                for j in 0..<hiddenSize {
-                    let e = float16ToFloat(embPtr[j])
-                    let w = float16ToFloat(projWPtr[rowStart + j])
-                    sum += e * w
-                }
-                proj[i] = sum * perLayerProjScale
-            }
-        }
+        cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                    Int32(totalDim), Int32(hiddenSize),
+                    perLayerProjScale,         // alpha = projScale
+                    perLayerProjF32, Int32(hiddenSize),  // A, lda
+                    embF32, 1,                 // x, incx
+                    0.0,                       // beta
+                    &proj, 1)                  // y, incy
 
-        // Step 2: Apply RMSNorm to each per_layer_dim slice of projection
+        // Step 2: Apply RMSNorm to each per_layer_dim slice
         if let normData = perLayerNormWeight {
             normData.withUnsafeBytes { normRaw in
                 let normW = normRaw.baseAddress!.assumingMemoryBound(to: Float.self)
                 let eps: Float = 1e-6
                 for li in 0..<nlayers {
                     let s = li * pld
-                    var meanSq: Float = 0
-                    for j in 0..<pld {
-                        meanSq += proj[s + j] * proj[s + j]
-                    }
-                    meanSq = meanSq / Float(pld) + eps
-                    let invRms = 1.0 / sqrtf(meanSq)
+                    var sumSq: Float = 0
+                    vDSP_svesq(&proj + s, 1, &sumSq, vDSP_Length(pld))
+                    let invRms = 1.0 / sqrtf(sumSq / Float(pld) + eps)
                     for j in 0..<pld {
                         proj[s + j] = proj[s + j] * invRms * normW[j]
                     }
