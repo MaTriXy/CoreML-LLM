@@ -50,6 +50,7 @@ final class LLMRunner {
     private var hiddenSize = 1536
     private var perLayerDim = 256
     private var architecture = "gemma4"
+    private var useExternalPLE = false
     private var currentPosition = 0
     private var embedScale: Float = 39.19
     private var perLayerProjScale: Float = 0.0255
@@ -120,6 +121,45 @@ final class LLMRunner {
         }
         state = model?.makeState()
         isChunked = false
+
+        // Check if model uses external embeddings (lite model has per_layer_combined input)
+        let hasExternalPLE = model?.modelDescription.inputDescriptionsByName["per_layer_combined"] != nil
+        if hasExternalPLE {
+            loadingStatus = "Loading external embeddings..."
+            let vocabSize = 262144
+            let nlayers = 35
+            let etURL = folder.appendingPathComponent("embed_tokens_q8.bin")
+            let etScalesURL = folder.appendingPathComponent("embed_tokens_scales.bin")
+            let eplURL = folder.appendingPathComponent("embed_tokens_per_layer_q8.bin")
+            let eplScalesURL = folder.appendingPathComponent("embed_tokens_per_layer_scales.bin")
+
+            if FileManager.default.fileExists(atPath: etURL.path) {
+                embedTokens = try EmbeddingLookup(dataURL: etURL, scalesURL: etScalesURL,
+                                                   vocabSize: vocabSize, dim: hiddenSize, scale: embedScale)
+                embedPerLayer = try EmbeddingLookup(dataURL: eplURL, scalesURL: eplScalesURL,
+                                                     vocabSize: vocabSize, dim: nlayers * perLayerDim, scale: perLayerEmbedScale)
+            }
+
+            perLayerProjWeight = try? Data(contentsOf: folder.appendingPathComponent("per_layer_projection.bin"), options: .mappedIfSafe)
+            perLayerNormWeight = try? Data(contentsOf: folder.appendingPathComponent("per_layer_norm_weight.bin"), options: .mappedIfSafe)
+
+            // Pre-convert projection to float32 for Accelerate BLAS
+            if let projData = perLayerProjWeight {
+                loadingStatus = "Converting projection..."
+                let count = nlayers * perLayerDim * hiddenSize
+                var f32 = [Float](repeating: 0, count: count)
+                projData.withUnsafeBytes { raw in
+                    let f16Ptr = raw.baseAddress!.assumingMemoryBound(to: UInt16.self)
+                    for i in 0..<count {
+                        f32[i] = Float(Float16(bitPattern: f16Ptr[i]))
+                    }
+                }
+                perLayerProjF32 = f32
+                perLayerProjWeight = nil
+            }
+
+            useExternalPLE = true
+        }
     }
 
     private func loadChunked(folder: URL, config mlConfig: MLModelConfiguration) async throws {
@@ -301,9 +341,17 @@ final class LLMRunner {
             "update_mask": MLFeatureValue(multiArray: umask),
         ]
 
+        // External PLE: compute per_layer_combined and pass as input
+        if useExternalPLE {
+            // Need embedding for per-layer computation
+            let emb = try embedTokens!.lookup(tokenID, shape: [1, 1, NSNumber(value: hiddenSize)])
+            let plc = try computePerLayerCombined(tokenID: tokenID, embedding: emb)
+            dict["per_layer_combined"] = MLFeatureValue(multiArray: plc)
+        }
+
         // Only pass image_embedding if the model accepts it
-        if let spec = try? model.modelDescription.inputDescriptionsByName,
-           spec["image_embedding"] != nil {
+        let inputNames = model.modelDescription.inputDescriptionsByName
+        if inputNames["image_embedding"] != nil {
             let hs = hiddenSize
             let imgEmb: MLMultiArray
             if let imageEmbedding {

@@ -133,17 +133,27 @@ final class ModelDownloader: NSObject {
 
         var files: [DownloadFile]
 
-        // Monolithic model (embeddings inside CoreML, managed by JIT decompression)
+        // Lite model: CoreML (1.34GB) + external PLE files
         files = [
-            .init(remotePath: "model.mlmodelc/weights/weight.bin", localPath: "model.mlmodelc/weights/weight.bin", estimatedSize: 2_500_000_000),
-            .init(remotePath: "model.mlmodelc/coremldata.bin", localPath: "model.mlmodelc/coremldata.bin", estimatedSize: 500_000),
-            .init(remotePath: "model.mlmodelc/model.mil", localPath: "model.mlmodelc/model.mil", estimatedSize: 100_000),
-            .init(remotePath: "model.mlmodelc/metadata.json", localPath: "model.mlmodelc/metadata.json", estimatedSize: 1_000),
-            .init(remotePath: "model.mlmodelc/analytics/coremldata.bin", localPath: "model.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
-            .init(remotePath: "model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
+            // CoreML model (transformer + embed_tokens + lm_head, no PLE weights)
+            .init(remotePath: "lite/model.mlmodelc/weights/weight.bin", localPath: "model.mlmodelc/weights/weight.bin", estimatedSize: 1_340_000_000),
+            .init(remotePath: "lite/model.mlmodelc/coremldata.bin", localPath: "model.mlmodelc/coremldata.bin", estimatedSize: 500_000),
+            .init(remotePath: "lite/model.mlmodelc/model.mil", localPath: "model.mlmodelc/model.mil", estimatedSize: 100_000),
+            .init(remotePath: "lite/model.mlmodelc/metadata.json", localPath: "model.mlmodelc/metadata.json", estimatedSize: 1_000),
+            .init(remotePath: "lite/model.mlmodelc/analytics/coremldata.bin", localPath: "model.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
+            .init(remotePath: "lite/model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
+            // Tokenizer
             .init(remotePath: "hf_model/tokenizer.json", localPath: "hf_model/tokenizer.json", estimatedSize: 30_000_000),
             .init(remotePath: "hf_model/tokenizer_config.json", localPath: "hf_model/tokenizer_config.json", estimatedSize: 5_000),
             .init(remotePath: "hf_model/config.json", localPath: "hf_model/config.json", estimatedSize: 5_000),
+            // External embeddings (memory-mapped)
+            .init(remotePath: "embed_tokens_q8.bin", localPath: "embed_tokens_q8.bin", estimatedSize: 402_653_184),
+            .init(remotePath: "embed_tokens_scales.bin", localPath: "embed_tokens_scales.bin", estimatedSize: 524_288),
+            .init(remotePath: "embed_tokens_per_layer_q8.bin", localPath: "embed_tokens_per_layer_q8.bin", estimatedSize: 2_348_810_240),
+            .init(remotePath: "embed_tokens_per_layer_scales.bin", localPath: "embed_tokens_per_layer_scales.bin", estimatedSize: 524_288),
+            // Per-layer projection
+            .init(remotePath: "per_layer_projection.bin", localPath: "per_layer_projection.bin", estimatedSize: 27_525_120),
+            .init(remotePath: "per_layer_norm_weight.bin", localPath: "per_layer_norm_weight.bin", estimatedSize: 1_024),
         ]
 
         totalBytesForAllFiles = files.reduce(0) { $0 + $1.estimatedSize }
