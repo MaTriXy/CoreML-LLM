@@ -139,7 +139,6 @@ final class ModelDownloader: NSObject {
             .init(remotePath: "lite/model.mlmodelc/weights/weight.bin", localPath: "model.mlmodelc/weights/weight.bin", estimatedSize: 1_340_000_000),
             .init(remotePath: "lite/model.mlmodelc/coremldata.bin", localPath: "model.mlmodelc/coremldata.bin", estimatedSize: 500_000),
             .init(remotePath: "lite/model.mlmodelc/model.mil", localPath: "model.mlmodelc/model.mil", estimatedSize: 100_000),
-            .init(remotePath: "lite/model.mlmodelc/metadata.json", localPath: "model.mlmodelc/metadata.json", estimatedSize: 1_000),
             .init(remotePath: "lite/model.mlmodelc/analytics/coremldata.bin", localPath: "model.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
             .init(remotePath: "lite/model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
             // Tokenizer
