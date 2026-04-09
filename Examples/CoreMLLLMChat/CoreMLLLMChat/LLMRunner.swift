@@ -18,13 +18,19 @@ final class LLMRunner {
     private var model: MLModel?
     private var state: MLState?
 
-    // Chunked model (for large models that don't fit in single compilation)
+    // Chunked model (stateless 4-chunk lite, ANE-optimized)
     private var chunk1: MLModel?
     private var chunk2: MLModel?
     private var chunk3: MLModel?
-    private var chunk1State: MLState?
-    private var chunk2State: MLState?
+    private var chunk4: MLModel?
+    private var chunk1State: MLState?  // unused in stateless mode
+    private var chunk2State: MLState?  // unused in stateless mode
     private var isChunked = false
+    // Persistent KV cache buffers for stateless chunks (zero-copy across calls)
+    private var statelessKV1_K: MLMultiArray?  // (8, 1, ctx, max_hd)
+    private var statelessKV1_V: MLMultiArray?
+    private var statelessKV2_K: MLMultiArray?  // (7, 1, ctx, max_hd)
+    private var statelessKV2_V: MLMultiArray?
 
     // Vision (lazy-loaded to save memory)
     private var visionModel: MLModel?
@@ -165,13 +171,27 @@ final class LLMRunner {
     }
 
     private func loadChunked(folder: URL, config mlConfig: MLModelConfiguration) async throws {
-        loadingStatus = "Loading chunk 1/2..."
+        // Stateless 4-chunk lite:
+        // chunk1: layers 0-7 + embedding, KV cache I/O (8 slots)
+        // chunk2: layers 8-14 (contains KV sources 13/14), KV cache I/O (7 slots) + kv13/14 output
+        // chunk3: layers 15-24 (all shared), no KV cache, uses kv13/14
+        // chunk4: layers 25-34 (all shared) + norm + lm_head, no KV cache, uses kv13/14
+        loadingStatus = "Loading chunk 1/4..."
         chunk1 = try MLModel(contentsOf: findModel(in: folder, name: "chunk1")!, configuration: mlConfig)
-        chunk1State = chunk1?.makeState()
 
-        loadingStatus = "Loading chunk 2/2..."
+        loadingStatus = "Loading chunk 2/4..."
         chunk2 = try MLModel(contentsOf: findModel(in: folder, name: "chunk2")!, configuration: mlConfig)
-        // chunk2 is stateless (all KV shared from chunk1's layers 13/14)
+
+        loadingStatus = "Loading chunk 3/4..."
+        chunk3 = try MLModel(contentsOf: findModel(in: folder, name: "chunk3")!, configuration: mlConfig)
+
+        loadingStatus = "Loading chunk 4/4..."
+        chunk4 = try MLModel(contentsOf: findModel(in: folder, name: "chunk4")!, configuration: mlConfig)
+
+        // Allocate persistent KV cache buffers (zero-filled)
+        loadingStatus = "Allocating KV cache..."
+        let maxHd = 512  // global_head_dim
+        try allocateStatelessKV(maxHd: maxHd)
 
         // Load external embeddings
         loadingStatus = "Loading external embeddings..."
@@ -209,6 +229,23 @@ final class LLMRunner {
 
         useExternalPLE = true
         isChunked = true
+    }
+
+    /// Allocate zero-filled KV cache buffers for stateless chunks.
+    private func allocateStatelessKV(maxHd: Int) throws {
+        let ctx = contextLength
+        func zeros(_ slots: Int) throws -> MLMultiArray {
+            let arr = try MLMultiArray(
+                shape: [NSNumber(value: slots), 1, NSNumber(value: ctx), NSNumber(value: maxHd)],
+                dataType: .float16
+            )
+            memset(arr.dataPointer, 0, slots * ctx * maxHd * MemoryLayout<UInt16>.stride)
+            return arr
+        }
+        statelessKV1_K = try zeros(8)  // chunk1: 8 layers
+        statelessKV1_V = try zeros(8)
+        statelessKV2_K = try zeros(7)  // chunk2: 7 layers
+        statelessKV2_V = try zeros(7)
     }
 
     /// Run a dummy prediction to force model compilation and catch ANE errors early.
@@ -323,8 +360,11 @@ final class LLMRunner {
 
     func resetConversation() {
         if isChunked {
-            chunk1State = chunk1?.makeState()
-            chunk2State = chunk2?.makeState()
+            // Zero out persistent KV cache buffers
+            if let k1 = statelessKV1_K { memset(k1.dataPointer, 0, k1.count * MemoryLayout<UInt16>.stride) }
+            if let v1 = statelessKV1_V { memset(v1.dataPointer, 0, v1.count * MemoryLayout<UInt16>.stride) }
+            if let k2 = statelessKV2_K { memset(k2.dataPointer, 0, k2.count * MemoryLayout<UInt16>.stride) }
+            if let v2 = statelessKV2_V { memset(v2.dataPointer, 0, v2.count * MemoryLayout<UInt16>.stride) }
         } else {
             state = model?.makeState()
         }
@@ -412,23 +452,28 @@ final class LLMRunner {
     // MARK: - Chunked Prediction
 
     private func predictChunked(tokenID: Int, position: Int, imageEmbedding: MLMultiArray? = nil) throws -> Int {
-        // 2-chunk lite architecture:
-        // chunk1: layers 0-14 + embedding (stateful)
-        // chunk2: layers 15-34 + norm + lm_head (stateless, KV13/14 passed in)
-        guard let chunk1, let chunk2,
-              let chunk1State,
-              let embedTokens else {
+        // Stateless 4-chunk lite architecture:
+        // chunk1: layers 0-7 + embedding, explicit KV I/O (8 slots)
+        // chunk2: layers 8-14 (KV sources 13/14), explicit KV I/O (7 slots), outputs kv13/14
+        // chunk3: layers 15-24 (all shared), no KV cache, takes kv13/14
+        // chunk4: layers 25-34 (all shared) + norm + lm_head, takes kv13/14
+        guard let chunk1, let chunk2, let chunk3, let chunk4,
+              let embedTokens,
+              let k1 = statelessKV1_K, let v1 = statelessKV1_V,
+              let k2 = statelessKV2_K, let v2 = statelessKV2_V else {
             var missing = [String]()
             if self.chunk1 == nil { missing.append("chunk1") }
             if self.chunk2 == nil { missing.append("chunk2") }
-            if self.chunk1State == nil { missing.append("chunk1_state") }
+            if self.chunk3 == nil { missing.append("chunk3") }
+            if self.chunk4 == nil { missing.append("chunk4") }
             if self.embedTokens == nil { missing.append("embed_tokens") }
+            if self.statelessKV1_K == nil { missing.append("KV1") }
+            if self.statelessKV2_K == nil { missing.append("KV2") }
             throw NSError(domain: "LLMRunner", code: 0,
                           userInfo: [NSLocalizedDescriptionKey: "Missing: \(missing.joined(separator: ", "))"])
         }
         let ctx = contextLength
 
-        // Embedding (for PLE projection)
         let t0 = CFAbsoluteTimeGetCurrent()
         let emb = try embedTokens.lookup(tokenID, shape: [1, 1, NSNumber(value: hiddenSize)])
         let t1 = CFAbsoluteTimeGetCurrent()
@@ -453,7 +498,8 @@ final class LLMRunner {
         }
 
         let tp = CFAbsoluteTimeGetCurrent()
-        // Chunk 1: embedding + layers 0-14, outputs hidden + kv13/14
+
+        // ---- Chunk 1: layers 0-7 + embedding ----
         let input1 = try MLDictionaryFeatureProvider(dictionary: [
             "input_ids": MLFeatureValue(multiArray: ids),
             "position_ids": MLFeatureValue(multiArray: pos),
@@ -461,17 +507,41 @@ final class LLMRunner {
             "update_mask": MLFeatureValue(multiArray: umask),
             "per_layer_combined": MLFeatureValue(multiArray: plc),
             "image_embedding": MLFeatureValue(multiArray: imgEmb),
+            "K_in": MLFeatureValue(multiArray: k1),
+            "V_in": MLFeatureValue(multiArray: v1),
         ])
-        let out1 = try chunk1.prediction(from: input1, using: chunk1State)
-        let hiddenStates = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
-        let kv13_k = out1.featureValue(for: "kv13_k")!.multiArrayValue!
-        let kv13_v = out1.featureValue(for: "kv13_v")!.multiArrayValue!
-        let kv14_k = out1.featureValue(for: "kv14_k")!.multiArrayValue!
-        let kv14_v = out1.featureValue(for: "kv14_v")!.multiArrayValue!
+        let out1 = try chunk1.prediction(from: input1)
+        let h1 = out1.featureValue(for: "hidden_states_out")!.multiArrayValue!
+        // Update persistent KV1 buffers with new cache (copy into same buffer)
+        let newK1 = out1.featureValue(for: "K_out")!.multiArrayValue!
+        let newV1 = out1.featureValue(for: "V_out")!.multiArrayValue!
+        memcpy(k1.dataPointer, newK1.dataPointer, k1.count * MemoryLayout<UInt16>.stride)
+        memcpy(v1.dataPointer, newV1.dataPointer, v1.count * MemoryLayout<UInt16>.stride)
 
-        // Chunk 2: layers 15-34 + norm + lm_head, uses kv13/14 from chunk1
+        // ---- Chunk 2: layers 8-14, emits kv13/14 ----
         let input2 = try MLDictionaryFeatureProvider(dictionary: [
-            "hidden_states": MLFeatureValue(multiArray: hiddenStates),
+            "hidden_states": MLFeatureValue(multiArray: h1),
+            "position_ids": MLFeatureValue(multiArray: pos),
+            "causal_mask": MLFeatureValue(multiArray: mask),
+            "update_mask": MLFeatureValue(multiArray: umask),
+            "per_layer_combined": MLFeatureValue(multiArray: plc),
+            "K_in": MLFeatureValue(multiArray: k2),
+            "V_in": MLFeatureValue(multiArray: v2),
+        ])
+        let out2 = try chunk2.prediction(from: input2)
+        let h2 = out2.featureValue(for: "hidden_states_out")!.multiArrayValue!
+        let newK2 = out2.featureValue(for: "K_out")!.multiArrayValue!
+        let newV2 = out2.featureValue(for: "V_out")!.multiArrayValue!
+        memcpy(k2.dataPointer, newK2.dataPointer, k2.count * MemoryLayout<UInt16>.stride)
+        memcpy(v2.dataPointer, newV2.dataPointer, v2.count * MemoryLayout<UInt16>.stride)
+        let kv13_k = out2.featureValue(for: "kv13_k")!.multiArrayValue!
+        let kv13_v = out2.featureValue(for: "kv13_v")!.multiArrayValue!
+        let kv14_k = out2.featureValue(for: "kv14_k")!.multiArrayValue!
+        let kv14_v = out2.featureValue(for: "kv14_v")!.multiArrayValue!
+
+        // ---- Chunk 3: layers 15-24 (shared KV) ----
+        let input3 = try MLDictionaryFeatureProvider(dictionary: [
+            "hidden_states": MLFeatureValue(multiArray: h2),
             "position_ids": MLFeatureValue(multiArray: pos),
             "causal_mask": MLFeatureValue(multiArray: mask),
             "update_mask": MLFeatureValue(multiArray: umask),
@@ -481,7 +551,23 @@ final class LLMRunner {
             "kv14_k": MLFeatureValue(multiArray: kv14_k),
             "kv14_v": MLFeatureValue(multiArray: kv14_v),
         ])
-        let out2 = try chunk2.prediction(from: input2)
+        let out3 = try chunk3.prediction(from: input3)
+        let h3 = out3.featureValue(for: "hidden_states_out")!.multiArrayValue!
+
+        // ---- Chunk 4: layers 25-34 + norm + lm_head ----
+        let input4 = try MLDictionaryFeatureProvider(dictionary: [
+            "hidden_states": MLFeatureValue(multiArray: h3),
+            "position_ids": MLFeatureValue(multiArray: pos),
+            "causal_mask": MLFeatureValue(multiArray: mask),
+            "update_mask": MLFeatureValue(multiArray: umask),
+            "per_layer_combined": MLFeatureValue(multiArray: plc),
+            "kv13_k": MLFeatureValue(multiArray: kv13_k),
+            "kv13_v": MLFeatureValue(multiArray: kv13_v),
+            "kv14_k": MLFeatureValue(multiArray: kv14_k),
+            "kv14_v": MLFeatureValue(multiArray: kv14_v),
+        ])
+        let out4 = try chunk4.prediction(from: input4)
+
         profilePredict += (CFAbsoluteTimeGetCurrent() - tp)
         profileCount += 1
         if profileCount % 10 == 0 {
@@ -490,7 +576,7 @@ final class LLMRunner {
                          profileEmbed/n * 1000, profilePLE/n * 1000, profilePredict/n * 1000,
                          1000.0 / ((profileEmbed + profilePLE + profilePredict) / n * 1000)))
         }
-        return out2.featureValue(for: "token_id")!.multiArrayValue![0].intValue
+        return out4.featureValue(for: "token_id")!.multiArrayValue![0].intValue
     }
 
     /// Look up cos/sin values for a position from a numpy .npy file.

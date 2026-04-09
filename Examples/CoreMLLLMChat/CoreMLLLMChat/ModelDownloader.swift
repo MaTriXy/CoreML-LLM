@@ -133,17 +133,25 @@ final class ModelDownloader: NSObject {
 
         var files: [DownloadFile]
 
-        // Lite chunks: 2 chunks (chunk1 = 0.49GB, chunk2 = 0.85GB) + external PLE
+        // Stateless 4-chunk lite (no MLState, explicit KV I/O) — ANE-optimized
         files = [
-            .init(remotePath: "lite-chunks/chunk1.mlmodelc/weights/weight.bin", localPath: "chunk1.mlmodelc/weights/weight.bin", estimatedSize: 490_000_000),
-            .init(remotePath: "lite-chunks/chunk1.mlmodelc/coremldata.bin", localPath: "chunk1.mlmodelc/coremldata.bin", estimatedSize: 500_000),
-            .init(remotePath: "lite-chunks/chunk1.mlmodelc/model.mil", localPath: "chunk1.mlmodelc/model.mil", estimatedSize: 100_000),
-            .init(remotePath: "lite-chunks/chunk1.mlmodelc/analytics/coremldata.bin", localPath: "chunk1.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
-            .init(remotePath: "lite-chunks/chunk2.mlmodelc/weights/weight.bin", localPath: "chunk2.mlmodelc/weights/weight.bin", estimatedSize: 850_000_000),
-            .init(remotePath: "lite-chunks/chunk2.mlmodelc/coremldata.bin", localPath: "chunk2.mlmodelc/coremldata.bin", estimatedSize: 500_000),
-            .init(remotePath: "lite-chunks/chunk2.mlmodelc/model.mil", localPath: "chunk2.mlmodelc/model.mil", estimatedSize: 100_000),
-            .init(remotePath: "lite-chunks/chunk2.mlmodelc/analytics/coremldata.bin", localPath: "chunk2.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
-            .init(remotePath: "lite-chunks/model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
+            .init(remotePath: "stateless/chunk1.mlmodelc/weights/weight.bin", localPath: "chunk1.mlmodelc/weights/weight.bin", estimatedSize: 350_000_000),
+            .init(remotePath: "stateless/chunk1.mlmodelc/coremldata.bin", localPath: "chunk1.mlmodelc/coremldata.bin", estimatedSize: 500_000),
+            .init(remotePath: "stateless/chunk1.mlmodelc/model.mil", localPath: "chunk1.mlmodelc/model.mil", estimatedSize: 100_000),
+            .init(remotePath: "stateless/chunk1.mlmodelc/analytics/coremldata.bin", localPath: "chunk1.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
+            .init(remotePath: "stateless/chunk2.mlmodelc/weights/weight.bin", localPath: "chunk2.mlmodelc/weights/weight.bin", estimatedSize: 130_000_000),
+            .init(remotePath: "stateless/chunk2.mlmodelc/coremldata.bin", localPath: "chunk2.mlmodelc/coremldata.bin", estimatedSize: 500_000),
+            .init(remotePath: "stateless/chunk2.mlmodelc/model.mil", localPath: "chunk2.mlmodelc/model.mil", estimatedSize: 100_000),
+            .init(remotePath: "stateless/chunk2.mlmodelc/analytics/coremldata.bin", localPath: "chunk2.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
+            .init(remotePath: "stateless/chunk3.mlmodelc/weights/weight.bin", localPath: "chunk3.mlmodelc/weights/weight.bin", estimatedSize: 330_000_000),
+            .init(remotePath: "stateless/chunk3.mlmodelc/coremldata.bin", localPath: "chunk3.mlmodelc/coremldata.bin", estimatedSize: 500_000),
+            .init(remotePath: "stateless/chunk3.mlmodelc/model.mil", localPath: "chunk3.mlmodelc/model.mil", estimatedSize: 100_000),
+            .init(remotePath: "stateless/chunk3.mlmodelc/analytics/coremldata.bin", localPath: "chunk3.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
+            .init(remotePath: "stateless/chunk4.mlmodelc/weights/weight.bin", localPath: "chunk4.mlmodelc/weights/weight.bin", estimatedSize: 530_000_000),
+            .init(remotePath: "stateless/chunk4.mlmodelc/coremldata.bin", localPath: "chunk4.mlmodelc/coremldata.bin", estimatedSize: 500_000),
+            .init(remotePath: "stateless/chunk4.mlmodelc/model.mil", localPath: "chunk4.mlmodelc/model.mil", estimatedSize: 100_000),
+            .init(remotePath: "stateless/chunk4.mlmodelc/analytics/coremldata.bin", localPath: "chunk4.mlmodelc/analytics/coremldata.bin", estimatedSize: 1_000),
+            .init(remotePath: "stateless/model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
             // Tokenizer
             .init(remotePath: "hf_model/tokenizer.json", localPath: "hf_model/tokenizer.json", estimatedSize: 30_000_000),
             .init(remotePath: "hf_model/tokenizer_config.json", localPath: "hf_model/tokenizer_config.json", estimatedSize: 5_000),
