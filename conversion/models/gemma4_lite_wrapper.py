@@ -164,14 +164,11 @@ class Gemma4LiteWrapper(nn.Module):
             K_expanded = K_for_attn.repeat_interleave(n_rep, dim=1)
             V_expanded = V_for_attn.repeat_interleave(n_rep, dim=1)
 
-            q_f = q.to(torch.float32)
-            k_f = K_expanded.to(torch.float32)
-            attn_weights = torch.matmul(q_f, k_f.transpose(-1, -2)) * scale
-            attn_weights = attn_weights + causal_mask.to(torch.float32)
-            attn_weights = torch.softmax(attn_weights, dim=-1).to(MODEL_DTYPE)
-            attn_output = torch.matmul(
-                attn_weights.to(torch.float32), V_expanded.to(torch.float32)
-            ).to(MODEL_DTYPE)
+            # All fp16 for ANE compatibility
+            attn_weights = torch.matmul(q, K_expanded.transpose(-1, -2)) * scale
+            attn_weights = attn_weights + causal_mask
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+            attn_output = torch.matmul(attn_weights, V_expanded)
 
             attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(1, 1, -1)
             attn_output = layer.self_attn["o_proj"](

@@ -85,17 +85,31 @@ final class LLMRunner {
         }
 
         let mlConfig = MLModelConfiguration()
-        #if os(iOS) || os(visionOS)
-        mlConfig.computeUnits = .cpuAndGPU  // ANE compiler rejects this model on iPhone
-        #else
-        mlConfig.computeUnits = .all        // ANE works on Mac
-        #endif
+        mlConfig.computeUnits = .all  // Try ANE first
 
         let chunk1URL = findModel(in: folder, name: "chunk1")
-        if chunk1URL != nil {
-            try await loadChunked(folder: folder, config: mlConfig)
-        } else {
-            try await loadMonolithic(url: url, folder: folder, config: mlConfig)
+        do {
+            if chunk1URL != nil {
+                try await loadChunked(folder: folder, config: mlConfig)
+            } else {
+                try await loadMonolithic(url: url, folder: folder, config: mlConfig)
+            }
+            // Force compilation by running a dummy prediction to catch ANE errors early
+            if let m = model, let s = state {
+                loadingStatus = "Verifying model..."
+                try dummyPredict(model: m, state: s)
+            }
+        } catch {
+            // ANE compilation failed, fall back to CPU+GPU
+            loadingStatus = "ANE failed, using CPU+GPU..."
+            mlConfig.computeUnits = .cpuAndGPU
+            model = nil
+            state = nil
+            if chunk1URL != nil {
+                try await loadChunked(folder: folder, config: mlConfig)
+            } else {
+                try await loadMonolithic(url: url, folder: folder, config: mlConfig)
+            }
         }
 
         // Vision model: defer loading to save memory (loaded on first image)
@@ -222,6 +236,36 @@ final class LLMRunner {
         sinFullTable = try? Data(contentsOf: folder.appendingPathComponent("sin_full.npy"), options: .mappedIfSafe)
 
         isChunked = true
+    }
+
+    /// Run a dummy prediction to force model compilation and catch ANE errors early.
+    private func dummyPredict(model: MLModel, state: MLState) throws {
+        let ctx = contextLength
+        let ids = try MLMultiArray(shape: [1, 1], dataType: .int32)
+        ids[[0, 0] as [NSNumber]] = NSNumber(value: Int32(2))
+        let pos = try MLMultiArray(shape: [1], dataType: .int32)
+        pos[0] = NSNumber(value: Int32(0))
+        let mask = try makeCausalMask(position: 0, contextLength: ctx)
+        let umask = try makeUpdateMask(position: 0, contextLength: ctx)
+
+        var dict: [String: MLFeatureValue] = [
+            "input_ids": MLFeatureValue(multiArray: ids),
+            "position_ids": MLFeatureValue(multiArray: pos),
+            "causal_mask": MLFeatureValue(multiArray: mask),
+            "update_mask": MLFeatureValue(multiArray: umask),
+        ]
+        let inputNames = model.modelDescription.inputDescriptionsByName
+        if inputNames["per_layer_combined"] != nil {
+            let plc = try MLMultiArray(shape: [1, 1, NSNumber(value: 35 * perLayerDim)], dataType: .float16)
+            memset(plc.dataPointer, 0, 35 * perLayerDim * MemoryLayout<UInt16>.stride)
+            dict["per_layer_combined"] = MLFeatureValue(multiArray: plc)
+        }
+        if inputNames["image_embedding"] != nil {
+            let img = try MLMultiArray(shape: [1, 1, NSNumber(value: hiddenSize)], dataType: .float16)
+            memset(img.dataPointer, 0, hiddenSize * MemoryLayout<UInt16>.stride)
+            dict["image_embedding"] = MLFeatureValue(multiArray: img)
+        }
+        _ = try model.prediction(from: MLDictionaryFeatureProvider(dictionary: dict), using: state)
     }
 
     private func findModel(in folder: URL, name: String) -> URL? {
