@@ -272,6 +272,21 @@ class Gemma4Model(nn.Module):
             self.lm_head.weight.data = embed_w.unsqueeze(-1).unsqueeze(-1)
             print("Tied lm_head weights to embed_tokens")
 
+        # Pre-scale q_norm weights by sqrt(head_dim) so Q is scaled up before
+        # attention. This lets us use F.scaled_dot_product_attention which
+        # always divides by sqrt(head_dim): sqrt(d)*Q @ K^T / sqrt(d) = Q @ K^T,
+        # matching Gemma 4's effective attention scale of 1.0 (Q/K are already
+        # unit-normalized by q_norm/k_norm).
+        # Fused ios18.scaled_dot_product_attention op only fires when scale is
+        # default (None), so pre-scaling Q is the cleanest way to reach it.
+        import math
+        for layer_idx, layer in enumerate(self.layers):
+            hd = self.config.get_head_dim(layer_idx)
+            scale = math.sqrt(hd)
+            with torch.no_grad():
+                layer.self_attn["q_norm"].weight.data.mul_(scale)
+        print(f"Pre-scaled q_norm weights by sqrt(head_dim) for SDPA fusion")
+
         print(f"Loaded {loaded} weight tensors")
 
     def _map_weight_name(self, hf_name: str) -> str | None:

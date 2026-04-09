@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb, ane_softmax
+from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb
 
 from .gemma4 import Gemma4Model
 
@@ -120,11 +120,9 @@ def _run_layer_prefill(
     K_expanded = K_for_attn.repeat_interleave(n_rep, dim=1)  # (1, num_heads, N, hd)
     V_expanded = V_for_attn.repeat_interleave(n_rep, dim=1)
 
-    # Attention: (1, num_heads, N, hd) @ (1, num_heads, hd, N) = (1, num_heads, N, N)
-    attn_weights = torch.matmul(q, K_expanded.transpose(-1, -2))
-    attn_weights = attn_weights + causal_mask  # broadcast (1, 1, N, N) → (1, H, N, N)
-    attn_weights = ane_softmax(attn_weights, dim=-1)
-    attn_output = torch.matmul(attn_weights, V_expanded)  # (1, num_heads, N, hd)
+    # Fused attention via SDPA — see gemma4_swa_chunks.py for rationale.
+    # q_norm pre-scaled weight makes SDPA's /sqrt(d) cancel out (scale=1.0).
+    attn_output = F.scaled_dot_product_attention(q, K_expanded, V_expanded, attn_mask=causal_mask)
 
     # Back to (1, hidden, 1, N) format for o_proj
     # (1, num_heads, N, hd) → (1, N, num_heads, hd) → (1, N, num_heads*hd) → (1, num_heads*hd, 1, N)

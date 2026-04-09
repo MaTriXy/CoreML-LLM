@@ -33,7 +33,7 @@ import torch.nn.functional as F
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb, ane_softmax
+from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb
 
 from .gemma4 import Gemma4Model
 
@@ -132,12 +132,14 @@ def _run_layer_swa(
     K_expanded = K_for_attn.repeat_interleave(n_rep, dim=1)
     V_expanded = V_for_attn.repeat_interleave(n_rep, dim=1)
 
-    # Attention (choose mask based on layer type)
+    # Fused attention via torch SDPA.
+    # q was pre-scaled by sqrt(hd) via q_norm.weight in load_weights(), so
+    # SDPA's internal /sqrt(hd) cancels out and we match Gemma 4's scale=1.0.
+    # coremltools 9.0 lowers this to ios18.scaled_dot_product_attention (one
+    # fused ANE kernel), replacing 5+ manual ops (matmul/add/reduce_max/sub/
+    # exp/reduce_sum/div/matmul).
     mask = causal_mask_full if is_full else causal_mask_sliding
-    attn_weights = torch.matmul(q, K_expanded.transpose(-1, -2))
-    attn_weights = attn_weights + mask
-    attn_weights = ane_softmax(attn_weights, dim=-1)
-    attn_output = torch.matmul(attn_weights, V_expanded)
+    attn_output = F.scaled_dot_product_attention(q, K_expanded, V_expanded, attn_mask=mask)
 
     attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(1, 1, -1)
     attn_output = layer.self_attn["o_proj"](
