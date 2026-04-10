@@ -225,27 +225,43 @@ final class LLMRunner {
             return m
         }
 
-        loadingStatus = "Loading decode chunk 1/4 (first run = ANE compile, can take 1-2 min)..."
-        chunk1 = try loadOne("chunk1", "decode 1/4")
-        loadingStatus = "Loading decode chunk 2/4..."
-        chunk2 = try loadOne("chunk2", "decode 2/4")
-        loadingStatus = "Loading decode chunk 3/4..."
-        chunk3 = try loadOne("chunk3", "decode 3/4")
-        loadingStatus = "Loading decode chunk 4/4..."
-        chunk4 = try loadOne("chunk4", "decode 4/4")
-
-        // Load prefill chunks as separate files (graceful fallback if missing).
-        if findModel(in: folder, name: "prefill_chunk1") != nil {
-            loadingStatus = "Loading prefill chunk 1/4..."
-            prefillChunk1 = try? loadOne("prefill_chunk1", "prefill 1/4")
-            loadingStatus = "Loading prefill chunk 2/4..."
-            prefillChunk2 = try? loadOne("prefill_chunk2", "prefill 2/4")
-            loadingStatus = "Loading prefill chunk 3/4..."
-            prefillChunk3 = try? loadOne("prefill_chunk3", "prefill 3/4")
-            loadingStatus = "Loading prefill chunk 4/4..."
-            prefillChunk4 = try? loadOne("prefill_chunk4", "prefill 4/4")
+        // Load all chunks in parallel. MLModel(contentsOf:) is thread-safe
+        // and the ANE compiler can pipeline compilation across chunks.
+        loadingStatus = "Loading chunks (first run = ANE compile, can take 1-2 min)..."
+        let hasPrefillFiles = findModel(in: folder, name: "prefill_chunk1") != nil
+        let loadT0 = CFAbsoluteTimeGetCurrent()
+        try await withThrowingTaskGroup(of: (String, MLModel).self) { group in
+            let chunkNames = ["chunk1", "chunk2", "chunk3", "chunk4"]
+            for name in chunkNames {
+                group.addTask {
+                    let m = try loadOne(name, name)
+                    return (name, m)
+                }
+            }
+            if hasPrefillFiles {
+                for name in ["prefill_chunk1", "prefill_chunk2", "prefill_chunk3", "prefill_chunk4"] {
+                    group.addTask {
+                        let m = try loadOne(name, name)
+                        return (name, m)
+                    }
+                }
+            }
+            for try await (name, model) in group {
+                switch name {
+                case "chunk1": chunk1 = model
+                case "chunk2": chunk2 = model
+                case "chunk3": chunk3 = model
+                case "chunk4": chunk4 = model
+                case "prefill_chunk1": prefillChunk1 = model
+                case "prefill_chunk2": prefillChunk2 = model
+                case "prefill_chunk3": prefillChunk3 = model
+                case "prefill_chunk4": prefillChunk4 = model
+                default: break
+                }
+            }
         }
-        print("[Load] All chunks loaded successfully")
+        let loadDt = CFAbsoluteTimeGetCurrent() - loadT0
+        print("[Load] All \(hasPrefillFiles ? 8 : 4) chunks loaded in \(String(format: "%.1f", loadDt))s (parallel)")
 
         // Allocate persistent SWA KV cache buffers
         loadingStatus = "Allocating KV cache..."
@@ -270,15 +286,20 @@ final class LLMRunner {
         perLayerProjWeight = try? Data(contentsOf: folder.appendingPathComponent("per_layer_projection.bin"), options: .mappedIfSafe)
         perLayerNormWeight = try? Data(contentsOf: folder.appendingPathComponent("per_layer_norm_weight.bin"), options: .mappedIfSafe)
 
-        // Pre-convert projection to float32 for Accelerate BLAS
+        // Pre-convert projection fp16 → fp32 for Accelerate BLAS
         if let projData = perLayerProjWeight {
             loadingStatus = "Converting projection..."
             let count = nlayers * perLayerDim * hiddenSize
             var f32 = [Float](repeating: 0, count: count)
             projData.withUnsafeBytes { raw in
                 let f16Ptr = raw.baseAddress!.assumingMemoryBound(to: UInt16.self)
-                for i in 0..<count {
-                    f32[i] = Float(Float16(bitPattern: f16Ptr[i]))
+                // Use Accelerate vImageConvert for vectorized fp16→fp32
+                var src = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: f16Ptr),
+                                        height: 1, width: UInt(count), rowBytes: count * 2)
+                f32.withUnsafeMutableBufferPointer { dst in
+                    var dstBuf = vImage_Buffer(data: dst.baseAddress!, height: 1,
+                                               width: UInt(count), rowBytes: count * 4)
+                    vImageConvert_Planar16FtoPlanarF(&src, &dstBuf, 0)
                 }
             }
             perLayerProjF32 = f32
