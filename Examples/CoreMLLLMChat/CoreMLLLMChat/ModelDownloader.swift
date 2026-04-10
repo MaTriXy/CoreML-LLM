@@ -131,10 +131,8 @@ final class ModelDownloader: NSObject {
     private func downloadFromHuggingFace(_ model: ModelInfo, to destDir: URL) async throws {
         let base = model.downloadURL
 
-        // v0.3 split layout: separate decode (SWA) and prefill mlmodelc files.
-        // Both use SDPA fusion, N=512 prefill, and fused PLE.
-        // (Multifunction was rejected by iPhone ANE compiler with std::bad_cast.)
-        let sdpaPrefix = "sdpa/"
+        // v0.5.1: 8K context chunks (same weights, larger KV shapes).
+        let sdpaPrefix = "sdpa-8k/"
         var files: [DownloadFile]
 
         files = [
@@ -171,7 +169,7 @@ final class ModelDownloader: NSObject {
             .init(remotePath: "\(sdpaPrefix)prefill/chunk4.mlmodelc/coremldata.bin",           localPath: "prefill_chunk4.mlmodelc/coremldata.bin",           estimatedSize: 1_000),
             .init(remotePath: "\(sdpaPrefix)prefill/chunk4.mlmodelc/model.mil",                localPath: "prefill_chunk4.mlmodelc/model.mil",                estimatedSize: 345_000),
             .init(remotePath: "\(sdpaPrefix)prefill/chunk4.mlmodelc/analytics/coremldata.bin", localPath: "prefill_chunk4.mlmodelc/analytics/coremldata.bin", estimatedSize: 250),
-            .init(remotePath: "swa/model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
+            .init(remotePath: "\(sdpaPrefix)model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
             // Tokenizer
             .init(remotePath: "hf_model/tokenizer.json", localPath: "hf_model/tokenizer.json", estimatedSize: 30_000_000),
             .init(remotePath: "hf_model/tokenizer_config.json", localPath: "hf_model/tokenizer_config.json", estimatedSize: 5_000),
