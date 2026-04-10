@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb
+from ane_ops import MODEL_DTYPE, apply_rotary_pos_emb, ane_softmax
 
 from .gemma4 import Gemma4Model
 
@@ -120,9 +120,13 @@ def _run_layer_prefill(
     K_expanded = K_for_attn.repeat_interleave(n_rep, dim=1)  # (1, num_heads, N, hd)
     V_expanded = V_for_attn.repeat_interleave(n_rep, dim=1)
 
-    # Fused attention via SDPA — see gemma4_swa_chunks.py for rationale.
-    # q_norm pre-scaled weight makes SDPA's /sqrt(d) cancel out (scale=1.0).
-    attn_output = F.scaled_dot_product_attention(q, K_expanded, V_expanded, attn_mask=causal_mask)
+    # Manual attention with scale=1.0 (Gemma 4 uses pre-normalized Q/K so no
+    # /sqrt(d) needed). Reverted from SDPA fusion because pre-scaling Q causes
+    # fp16 overflow at large N.
+    attn_weights = torch.matmul(q, K_expanded.transpose(-1, -2))
+    attn_weights = attn_weights + causal_mask
+    attn_weights = ane_softmax(attn_weights, dim=-1)
+    attn_output = torch.matmul(attn_weights, V_expanded)
 
     # Back to (1, hidden, 1, N) format for o_proj
     # (1, num_heads, N, hd) → (1, N, num_heads, hd) → (1, N, num_heads*hd) → (1, num_heads*hd, 1, N)
@@ -203,24 +207,17 @@ class PrefillChunk1(nn.Module):
 
     def _compute_ple_batch(self, hidden_states, per_layer_raw):
         """Compute per_layer_combined for batched input (1, N, hidden).
-
-        Fused version: reshape to (1, N, num_layers, per_layer_dim) and apply
-        a single ANE cat-trick layer_norm across all layer slices at once,
-        replacing 35 individual norms + 34 concats with 1 op."""
+        Original loop version (one ANERMSNorm per layer slice)."""
         N = PREFILL_N
-        # (1, N, hidden) → (1, hidden, 1, N)
         h_conv = hidden_states.permute(0, 2, 1).unsqueeze(2).to(MODEL_DTYPE)
-        proj = self.per_layer_model_projection(h_conv) * self.per_layer_model_projection_scale  # (1, total_pld, 1, N)
+        proj = self.per_layer_model_projection(h_conv) * self.per_layer_model_projection_scale
         proj = proj.squeeze(2).permute(0, 2, 1)  # (1, N, total_pld)
-        # (1, N, num_layers * pld) → (1, N, num_layers, pld) → cat-trick over last dim
-        proj_grouped = proj.view(1, N, self.num_layers_total, self.per_layer_dim)
-        norm_w = self.per_layer_projection_norm.weight
-        eps = float(self.per_layer_projection_norm.eps)
-        doubled = torch.cat([proj_grouped, -proj_grouped], dim=-1)
-        normed = F.layer_norm(doubled, normalized_shape=(2 * self.per_layer_dim,),
-                              weight=None, bias=None, eps=eps)
-        normed, _ = torch.chunk(normed, 2, dim=-1)
-        proj_normed = (normed * norm_w).view(1, N, self.num_layers_total * self.per_layer_dim)
+        normed_slices = []
+        for li in range(self.num_layers_total):
+            s = li * self.per_layer_dim
+            e = s + self.per_layer_dim
+            normed_slices.append(self.per_layer_projection_norm(proj[:, :, s:e]))
+        proj_normed = torch.cat(normed_slices, dim=-1)
         return (proj_normed + per_layer_raw) * self.per_layer_input_scale
 
     def forward(self, hidden_states, causal_mask, per_layer_raw,

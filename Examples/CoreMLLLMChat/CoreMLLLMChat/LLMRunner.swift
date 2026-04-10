@@ -393,12 +393,10 @@ final class LLMRunner {
                         return
                     }
 
-                    // DEBUG: temporarily disable prefill path to verify the
-                    // bug is in our prefill chunks vs the decode chunks.
-                    // Force per-token decode (v0.2.0 behaviour).
-                    let FORCE_PER_TOKEN_DECODE = true
-                    let havePrefill = !FORCE_PER_TOKEN_DECODE
-                        && self.isChunked
+                    // Hybrid path: batched prefill for first up to N tokens,
+                    // then per-token decode for the rest. Prefill bug from earlier
+                    // (q_norm pre-scaling overflow) is fixed in v0.3.
+                    let havePrefill = self.isChunked
                         && self.prefillChunk1 != nil
                         && self.prefillChunk2 != nil
                         && self.prefillChunk3 != nil
@@ -421,7 +419,7 @@ final class LLMRunner {
                             for step in prefillLen..<tokenIDs.count {
                                 let tid = tokenIDs[step]
                                 try autoreleasepool {
-                                    if tid == IMAGE_TOKEN_ID, let feats = imageFeatures, imageIdx < 280 {
+                                    if tid == IMAGE_TOKEN_ID, let feats = imageFeatures, imageIdx < 256 {
                                         let imgEmb = self.sliceFeature(feats, at: imageIdx)
                                         nextID = try self.predictStep(tokenID: 0, position: step, imageEmbedding: imgEmb)
                                         imageIdx += 1
@@ -436,7 +434,7 @@ final class LLMRunner {
                     } else {
                         for (step, tid) in tokenIDs.enumerated() {
                             try autoreleasepool {
-                                if tid == IMAGE_TOKEN_ID, let feats = imageFeatures, imageIdx < 280 {
+                                if tid == IMAGE_TOKEN_ID, let feats = imageFeatures, imageIdx < 256 {
                                     let imgEmb = self.sliceFeature(feats, at: imageIdx)
                                     nextID = try self.predictStep(tokenID: 0, position: step, imageEmbedding: imgEmb)
                                     imageIdx += 1
@@ -916,7 +914,7 @@ final class LLMRunner {
             to: UInt16.self, capacity: imageFeatures!.count)
         var imageIdx = 0
         for (i, tid) in tokenIDs.enumerated() {
-            if tid == IMAGE_TOKEN_ID, let fp = featPtr, imageIdx < 280 {
+            if tid == IMAGE_TOKEN_ID, let fp = featPtr, imageIdx < 256 {
                 // Vision encoder output is (1, 280, hidden). Copy slice `imageIdx`.
                 memcpy(dst.advanced(by: i * hiddenSize),
                        fp.advanced(by: imageIdx * hiddenSize),
@@ -1308,11 +1306,14 @@ final class LLMRunner {
         }
         var p = "<bos>"
         // HuggingFace Gemma3nProcessor wraps image tokens with BOI/EOI markers.
-        // For a single image: <|image> + <|image|> * 280 + <image|>
-        //   255999 (boi) + 258880 * 280 (image content, padded) + 258882 (eoi)
-        // The vision encoder always outputs 280 soft tokens regardless of actual
-        // grid (smaller grids are zero-padded), so we always insert 280 placeholders.
-        let imageBlock = "<|image>" + String(repeating: "<|image|>", count: 280) + "<image|>"
+        // For a square 768x768 input: 48x48=2304 patches → 2304/9 = 256 actual
+        // soft tokens. The vision encoder OUTPUT tensor is always (1, 280, hidden)
+        // (max_soft_tokens=280) but the prompt should use only the REAL count
+        // because tokens 256..279 are zero padding inside the encoder output.
+        // Inserting 280 placeholders feeds the model 24 zero "image" hidden
+        // states which it tries to interpret → garbled output.
+        // For a single square image: <|image> + <|image|> * 256 + <image|>
+        let imageBlock = "<|image>" + String(repeating: "<|image|>", count: 256) + "<image|>"
         for m in messages {
             if m.role == .user {
                 if hasImage {
