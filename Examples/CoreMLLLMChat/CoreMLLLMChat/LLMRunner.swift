@@ -318,11 +318,40 @@ final class LLMRunner {
         isChunked = true
     }
 
-    /// Allocate SWA KV buffers: separate sliding (W=512) and full (ctx) caches.
+    /// Allocate SWA KV buffers with IOSurface backing for zero-copy ANE I/O.
+    ///
+    /// IOSurface-backed MLMultiArray avoids memory copies between CPU and ANE.
+    /// Falls back to standard MLMultiArray if IOSurface creation fails.
     private func allocateSWAKV(maxHd: Int) throws {
         let ctx = contextLength
         let W = slidingWindow
-        func zeros(slots: Int, seqLen: Int) throws -> MLMultiArray {
+
+        func ioSurfaceArray(slots: Int, seqLen: Int) throws -> MLMultiArray {
+            // IOSurface pixel buffer: width = last dim (maxHd), height = product of other dims
+            let width = maxHd
+            let height = slots * 1 * seqLen
+            var pixelBuffer: CVPixelBuffer?
+            let attrs: [String: Any] = [
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+            ]
+            let status = CVPixelBufferCreate(
+                kCFAllocatorDefault, width, height,
+                kCVPixelFormatType_OneComponent16Half,
+                attrs as CFDictionary, &pixelBuffer
+            )
+            if status == kCVReturnSuccess, let pb = pixelBuffer {
+                // Zero the buffer
+                CVPixelBufferLockBaseAddress(pb, [])
+                let ptr = CVPixelBufferGetBaseAddress(pb)!
+                memset(ptr, 0, CVPixelBufferGetDataSize(pb))
+                CVPixelBufferUnlockBaseAddress(pb, [])
+                let shape: [NSNumber] = [NSNumber(value: slots), 1,
+                                          NSNumber(value: seqLen), NSNumber(value: maxHd)]
+                return try MLMultiArray(pixelBuffer: pb, shape: shape)
+            }
+            // Fallback to standard allocation
+            print("[KV] IOSurface failed for \(slots)x\(seqLen)x\(maxHd), using standard MLMultiArray")
             let arr = try MLMultiArray(
                 shape: [NSNumber(value: slots), 1, NSNumber(value: seqLen), NSNumber(value: maxHd)],
                 dataType: .float16
@@ -330,16 +359,18 @@ final class LLMRunner {
             memset(arr.dataPointer, 0, slots * seqLen * maxHd * MemoryLayout<UInt16>.stride)
             return arr
         }
+
         // Chunk1: 7 sliding + 1 full
-        kSliding1 = try zeros(slots: 7, seqLen: W)
-        vSliding1 = try zeros(slots: 7, seqLen: W)
-        kFull1 = try zeros(slots: 1, seqLen: ctx)
-        vFull1 = try zeros(slots: 1, seqLen: ctx)
+        kSliding1 = try ioSurfaceArray(slots: 7, seqLen: W)
+        vSliding1 = try ioSurfaceArray(slots: 7, seqLen: W)
+        kFull1 = try ioSurfaceArray(slots: 1, seqLen: ctx)
+        vFull1 = try ioSurfaceArray(slots: 1, seqLen: ctx)
         // Chunk2: 5 sliding + 2 full
-        kSliding2 = try zeros(slots: 5, seqLen: W)
-        vSliding2 = try zeros(slots: 5, seqLen: W)
-        kFull2 = try zeros(slots: 2, seqLen: ctx)
-        vFull2 = try zeros(slots: 2, seqLen: ctx)
+        kSliding2 = try ioSurfaceArray(slots: 5, seqLen: W)
+        vSliding2 = try ioSurfaceArray(slots: 5, seqLen: W)
+        kFull2 = try ioSurfaceArray(slots: 2, seqLen: ctx)
+        vFull2 = try ioSurfaceArray(slots: 2, seqLen: ctx)
+        print("[KV] Allocated \(8) IOSurface-backed KV cache buffers")
     }
 
     /// Run a dummy prediction to force model compilation and catch ANE errors early.
