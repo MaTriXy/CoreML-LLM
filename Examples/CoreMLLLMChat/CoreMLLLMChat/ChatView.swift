@@ -285,6 +285,9 @@ struct ChatView: View {
                 let abortNote = result.abortedThermal
                     ? "\nAborted       : YES (thermal .serious — protecting battery)"
                     : ""
+                let logLines = result.batteryLog.map { entry in
+                    "  \(String(format: "%5.0f", entry.0))s → \(Int(entry.1 * 100))%"
+                }.joined(separator: "\n")
                 let summary = """
                 [Benchmark RESULT]
                 Duration      : \(Int(result.duration))s (\(String(format: "%.1f", result.duration / 60.0)) min)
@@ -295,6 +298,8 @@ struct ChatView: View {
                 Drain rate    : \(String(format: "%.3f", result.drainedPerMinute))%/min
                 Tokens/%SoC   : \(String(format: "%.0f", result.tokensPerPercent))
                 Thermal       : \(LLMRunner.thermalString(result.thermalStart)) → \(LLMRunner.thermalString(result.thermalEnd))\(abortNote)
+                Battery log:
+                \(logLines)
                 """
                 print(summary)
                 benchmarkStatus = "Benchmark done. See chat for result."

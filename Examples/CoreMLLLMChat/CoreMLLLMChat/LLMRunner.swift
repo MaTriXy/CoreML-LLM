@@ -1390,6 +1390,7 @@ final class LLMRunner {
         var thermalStart: ProcessInfo.ThermalState
         var thermalEnd: ProcessInfo.ThermalState
         var abortedThermal: Bool = false
+        var batteryLog: [(TimeInterval, Float)] = []  // (elapsed, level) at each change
 
         var batteryDelta: Float { batteryStart - batteryEnd }  // positive = drained
         var drainedPercent: Double { Double(batteryDelta) * 100.0 }
@@ -1415,11 +1416,10 @@ final class LLMRunner {
         var totalTokens = 0
         var round = 0
         var abortedThermal = false
+        var batteryLog: [(TimeInterval, Float)] = [(0, startBat)]
+        var lastLoggedLevel = startBat
         let prompt = ChatMessage(role: .user, content: Self.benchmarkPrompt)
 
-        // Safety: if the device reaches .serious thermal state (iOS has
-        // already started aggressive throttling and the case is probably
-        // >40 °C), we stop immediately. .critical means stop no matter what.
         func isThermalUnsafe() -> Bool {
             let s = ProcessInfo.processInfo.thermalState
             return s == .serious || s == .critical
@@ -1428,13 +1428,18 @@ final class LLMRunner {
         while Date().timeIntervalSince(startTime) < duration {
             if isThermalUnsafe() { abortedThermal = true; break }
             round += 1
-            // AsyncStream of decoded chunks — count by fragment, close to
-            // token count (decode() can occasionally emit multi-token chunks
-            // for merged BPE pieces, but for greedy decoding it's ~1:1).
             let stream = try await generate(messages: [prompt], image: nil)
             for await _ in stream {
                 totalTokens += 1
                 let elapsed = Date().timeIntervalSince(startTime)
+                // Log battery level changes with timestamp
+                let currentLevel = UIDevice.current.batteryLevel
+                if currentLevel >= 0 && currentLevel != lastLoggedLevel {
+                    batteryLog.append((elapsed, currentLevel))
+                    let pct = Int(currentLevel * 100)
+                    print("[Bench] Battery changed to \(pct)% at \(String(format: "%.0f", elapsed))s")
+                    lastLoggedLevel = currentLevel
+                }
                 if totalTokens % 20 == 0 {
                     let prog = BenchmarkProgress(
                         elapsed: elapsed,
@@ -1442,7 +1447,7 @@ final class LLMRunner {
                         round: round,
                         avgTokPerSec: elapsed > 0 ? Double(totalTokens) / elapsed : 0,
                         batteryStart: startBat,
-                        batteryNow: UIDevice.current.batteryLevel,
+                        batteryNow: currentLevel,
                         thermal: ProcessInfo.processInfo.thermalState
                     )
                     onProgress(prog)
@@ -1458,6 +1463,7 @@ final class LLMRunner {
         let endBat = UIDevice.current.batteryLevel
         let endThermal = ProcessInfo.processInfo.thermalState
         let dur = endTime.timeIntervalSince(startTime)
+        batteryLog.append((dur, endBat))
         return BenchmarkResult(
             duration: dur,
             totalTokens: totalTokens,
@@ -1467,7 +1473,8 @@ final class LLMRunner {
             batteryEnd: endBat,
             thermalStart: startThermal,
             thermalEnd: endThermal,
-            abortedThermal: abortedThermal
+            abortedThermal: abortedThermal,
+            batteryLog: batteryLog
         )
     }
 
@@ -1593,41 +1600,14 @@ final class LLMRunner {
 
     /// Lightweight memory + battery report (no MLComputePlan, instant).
     func memoryReport() -> String {
-        var lines = ["Battery (IOPowerSources):"]
-        // IOKit.ps is not importable on iOS, but the symbols exist at runtime.
-        // Use dlsym to call IOPSCopyPowerSourcesInfo / IOPSCopyPowerSourcesList.
-        typealias CopyInfoFn = @convention(c) () -> Unmanaged<CFTypeRef>?
-        typealias CopyListFn = @convention(c) (CFTypeRef?) -> Unmanaged<CFArray>?
-        typealias GetDescFn = @convention(c) (CFTypeRef?, CFTypeRef) -> Unmanaged<CFDictionary>?
-
-        let handle = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY)
-        let pInfo = dlsym(handle, "IOPSCopyPowerSourcesInfo")
-        let pList = dlsym(handle, "IOPSCopyPowerSourcesList")
-        let pDesc = dlsym(handle, "IOPSGetPowerSourceDescription")
-
-        if let pInfo, let pList, let pDesc {
-            let copyInfo = unsafeBitCast(pInfo, to: CopyInfoFn.self)
-            let copyList = unsafeBitCast(pList, to: CopyListFn.self)
-            let getDesc = unsafeBitCast(pDesc, to: GetDescFn.self)
-
-            let blob = copyInfo()?.takeRetainedValue()
-            if let sources = copyList(blob)?.takeRetainedValue() as? [Any],
-               let source = sources.first {
-                if let desc = getDesc(blob, source as CFTypeRef)?
-                    .takeUnretainedValue() as? [String: Any] {
-                    for (key, val) in desc.sorted(by: { $0.key < $1.key }) {
-                        lines.append("  \(key): \(val)")
-                    }
-                    if let mA = desc["Current"] as? Int, let mV = desc["Voltage"] as? Int {
-                        let watts = Double(abs(mA)) * Double(mV) / 1_000_000.0
-                        lines.append("  ** Power: \(String(format: "%.2f", watts)) W **")
-                    }
-                }
-            }
-        } else {
-            lines.append("  (IOPowerSources symbols not found)")
-        }
-        if handle != nil { dlclose(handle) }
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        let level = UIDevice.current.batteryLevel
+        let state = UIDevice.current.batteryState
+        let stateStr = state == .charging ? "charging" : state == .full ? "full" : "unplugged"
+        var lines = ["Battery:"]
+        lines.append("  level: \(level >= 0 ? "\(Int(level * 100))%" : "unknown")")
+        lines.append("  state: \(stateStr)")
+        lines.append("  thermal: \(Self.thermalString(ProcessInfo.processInfo.thermalState))")
 
         lines.append("")
         lines.append("Memory (task_vm_info):")
