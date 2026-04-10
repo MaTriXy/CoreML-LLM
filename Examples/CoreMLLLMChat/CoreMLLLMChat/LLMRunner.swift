@@ -1538,6 +1538,34 @@ final class LLMRunner {
         let pctAll = dispatchedAll > 0 ? Int((Double(aAll) / Double(dispatchedAll) * 100.0).rounded()) : 0
         lines.append("  ----")
         lines.append("  TOTAL            \(aAll)/\(dispatchedAll) ANE (\(pctAll)%)  GPU=\(gAll) CPU=\(cAll)  [\(tAll) total ops]")
+
+        // Memory diagnostics — phys_footprint is what iOS uses for jetsam
+        // (kill) decisions. Xcode's memory gauge may underreport when
+        // memory-mapped files (embeddings, RoPE tables) haven't been paged in.
+        lines.append("")
+        lines.append("Memory (task_vm_info):")
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        if kr == KERN_SUCCESS {
+            let phys = Double(info.phys_footprint) / 1024 / 1024
+            let resident = Double(info.resident_size) / 1024 / 1024
+            let virtual_ = Double(info.virtual_size) / 1024 / 1024
+            let compressed = Double(info.compressed) / 1024 / 1024
+            lines.append("  phys_footprint : \(String(format: "%.1f", phys)) MB  (jetsam basis)")
+            lines.append("  resident_size  : \(String(format: "%.1f", resident)) MB")
+            lines.append("  virtual_size   : \(String(format: "%.1f", virtual_)) MB")
+            lines.append("  compressed     : \(String(format: "%.1f", compressed)) MB")
+        } else {
+            lines.append("  (task_info failed: \(kr))")
+        }
+        let available = os_proc_available_memory()
+        lines.append("  os_proc_available: \(available / 1024 / 1024) MB")
+
         return lines.joined(separator: "\n")
     }
 
