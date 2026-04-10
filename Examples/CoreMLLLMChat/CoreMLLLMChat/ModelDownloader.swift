@@ -136,7 +136,7 @@ final class ModelDownloader: NSObject {
         var files: [DownloadFile]
 
         // Download .mlmodelc files (same format as sdpa/ — verified working on iPhone).
-        func mlc(_ sub: String, _ name: String, _ localName: String, weightSize: Int) -> [DownloadFile] {
+        func mlc(_ sub: String, _ name: String, _ localName: String, weightSize: Int64) -> [DownloadFile] {
             [.init(remotePath: "\(sdpaPrefix)\(sub)/\(localName).mlmodelc/weights/weight.bin",
                    localPath: "\(localName).mlmodelc/weights/weight.bin", estimatedSize: weightSize),
              .init(remotePath: "\(sdpaPrefix)\(sub)/\(localName).mlmodelc/coremldata.bin",
