@@ -439,10 +439,12 @@ class SWAChunk4(nn.Module):
                 kv13_k, kv13_v, kv14_k, kv14_v,
             )
 
-        hidden_states = self.norm(hidden_states)
-        x = hidden_states.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
+        normed = self.norm(hidden_states)
+        x = normed.to(MODEL_DTYPE).permute(0, 2, 1).unsqueeze(2)
         logits = self.lm_head(x).squeeze(2).permute(0, 2, 1)
         if self.softcap > 0:
             logits = torch.tanh(logits / self.softcap) * self.softcap
         token_id, token_logit = self.argmax(logits.squeeze(0))
-        return token_id, token_logit
+        # Output normed hidden state for Medusa speculative decoding heads.
+        # Shape: (1, 1, hidden_size) — the last hidden state before lm_head.
+        return token_id, token_logit, normed
