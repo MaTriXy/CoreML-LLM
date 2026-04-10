@@ -1379,24 +1379,34 @@ final class LLMRunner {
             return "No chunks found under \(folder.lastPathComponent)."
         }
 
+        // MLComputePlan.deviceUsage(for:) returns nil for "virtual" ops that
+        // don't dispatch at runtime — const, constexpr_affine_dequantize,
+        // constexpr_lut_to_dense (INT4 palette expansion), metadata-only
+        // reshape/transpose etc. These are resolved at compile time and
+        // shouldn't appear in the denominator. We report:
+        //   "X/Y ANE" where Y = dispatched ops (ane + gpu + cpu).
+        // The total op count is shown separately as a sanity check.
         var lines: [String] = []
-        lines.append("MLComputePlan placement (preferred device per op):")
+        lines.append("MLComputePlan placement (dispatched ops only;")
+        lines.append("virtual/constexpr ops excluded from %):")
         var tAll = 0, aAll = 0, gAll = 0, cAll = 0
         for e in entries {
             do {
                 let plan = try await MLComputePlan.load(contentsOf: e.url, configuration: e.cfg)
                 let (total, ane, gpu, cpu) = countOps(plan: plan)
                 tAll += total; aAll += ane; gAll += gpu; cAll += cpu
-                let pct = total > 0 ? Int((Double(ane) / Double(total) * 100.0).rounded()) : 0
+                let dispatched = ane + gpu + cpu
+                let pct = dispatched > 0 ? Int((Double(ane) / Double(dispatched) * 100.0).rounded()) : 0
                 let label = e.label.padding(toLength: 16, withPad: " ", startingAt: 0)
-                lines.append("  \(label) \(ane)/\(total) ANE (\(pct)%)  \(gpu) GPU  \(cpu) CPU")
+                lines.append("  \(label) \(ane)/\(dispatched) ANE (\(pct)%)  GPU=\(gpu) CPU=\(cpu)  [\(total) total ops]")
             } catch {
                 lines.append("  \(e.label): failed — \(error.localizedDescription)")
             }
         }
-        let pctAll = tAll > 0 ? Int((Double(aAll) / Double(tAll) * 100.0).rounded()) : 0
+        let dispatchedAll = aAll + gAll + cAll
+        let pctAll = dispatchedAll > 0 ? Int((Double(aAll) / Double(dispatchedAll) * 100.0).rounded()) : 0
         lines.append("  ----")
-        lines.append("  TOTAL            \(aAll)/\(tAll) ANE (\(pctAll)%)  \(gAll) GPU  \(cAll) CPU")
+        lines.append("  TOTAL            \(aAll)/\(dispatchedAll) ANE (\(pctAll)%)  GPU=\(gAll) CPU=\(cAll)  [\(tAll) total ops]")
         return lines.joined(separator: "\n")
     }
 
