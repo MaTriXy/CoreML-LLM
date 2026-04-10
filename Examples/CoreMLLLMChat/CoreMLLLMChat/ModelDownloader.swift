@@ -114,6 +114,17 @@ final class ModelDownloader: NSObject {
             try? fileManager.removeItem(at: tempZip)
         }
 
+        // Share decode weights with prefill chunks (saves ~1.1 GB download)
+        for i in 1...4 {
+            let src = destDir.appendingPathComponent("chunk\(i).mlmodelc/weights/weight.bin")
+            let dst = destDir.appendingPathComponent("prefill_chunk\(i).mlmodelc/weights/weight.bin")
+            if fileManager.fileExists(atPath: src.path) && !fileManager.fileExists(atPath: dst.path) {
+                try fileManager.createDirectory(at: dst.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+                try fileManager.copyItem(at: src, to: dst)
+            }
+        }
+
         guard let result = localModelURL(for: model) else { throw DownloadError.extractionFailed }
         status = "Ready"
         progress = 1.0
@@ -148,14 +159,25 @@ final class ModelDownloader: NSObject {
              .init(remotePath: "\(sdpaPrefix)\(sub)/\(localName).mlmodelc/analytics/coremldata.bin",
                    localPath: "\(localName).mlmodelc/analytics/coremldata.bin", estimatedSize: 250)]
         }
+        // Prefill metadata only (no weight.bin — shared with decode chunks)
+        func prefillMeta(_ localName: String, _ decodeChunk: String) -> [DownloadFile] {
+            [.init(remotePath: "\(sdpaPrefix)prefill/\(localName).mlmodelc/coremldata.bin",
+                   localPath: "\(localName).mlmodelc/coremldata.bin", estimatedSize: 1_000),
+             .init(remotePath: "\(sdpaPrefix)prefill/\(localName).mlmodelc/model.mil",
+                   localPath: "\(localName).mlmodelc/model.mil", estimatedSize: 450_000),
+             .init(remotePath: "\(sdpaPrefix)prefill/\(localName).mlmodelc/metadata.json",
+                   localPath: "\(localName).mlmodelc/metadata.json", estimatedSize: 8_000),
+             .init(remotePath: "\(sdpaPrefix)prefill/\(localName).mlmodelc/analytics/coremldata.bin",
+                   localPath: "\(localName).mlmodelc/analytics/coremldata.bin", estimatedSize: 250)]
+        }
         files = mlc("swa", "chunk1", weightSize: 155_436_864)
              + mlc("swa", "chunk2", weightSize: 133_963_968)
              + mlc("swa", "chunk3", weightSize: 325_282_880)
              + mlc("swa", "chunk4", weightSize: 526_874_880)
-             + mlc("prefill", "prefill_chunk1", weightSize: 155_436_864)
-             + mlc("prefill", "prefill_chunk2", weightSize: 133_963_968)
-             + mlc("prefill", "prefill_chunk3", weightSize: 325_282_880)
-             + mlc("prefill", "prefill_chunk4", weightSize: 526_874_880)
+             + prefillMeta("prefill_chunk1", "chunk1")
+             + prefillMeta("prefill_chunk2", "chunk2")
+             + prefillMeta("prefill_chunk3", "chunk3")
+             + prefillMeta("prefill_chunk4", "chunk4")
         files += [
             .init(remotePath: "\(sdpaPrefix)model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
             // Tokenizer
