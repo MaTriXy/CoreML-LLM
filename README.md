@@ -6,7 +6,9 @@ CoreML-LLM targets the **Apple Neural Engine** rather than the GPU, making it a 
 
 > **v0.4.0** — Multimodal image understanding, PLE corruption fix, memory diagnostics. See [What's new](#whats-new-in-v040).
 
-![demo](https://github.com/user-attachments/assets/67584300-ce34-4aa5-b3bd-5521cfe8855a)
+| Text | Multimodal |
+|------|------------|
+| ![text](https://github.com/user-attachments/assets/67584300-ce34-4aa5-b3bd-5521cfe8855a) | ![multimodal](https://github.com/user-attachments/assets/2a869bf5-8315-422d-8b06-a4a7edecd173) |
 
 ## Performance (Gemma 4 E2B, iPhone 17 Pro)
 
