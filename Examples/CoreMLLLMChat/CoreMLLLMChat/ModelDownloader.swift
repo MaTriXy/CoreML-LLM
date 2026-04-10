@@ -135,24 +135,27 @@ final class ModelDownloader: NSObject {
         let sdpaPrefix = "sdpa-8k/"
         var files: [DownloadFile]
 
-        // Download .mlpackage (3 files each). iPhone compiles to .mlmodelc on first load.
-        // This avoids cross-platform compilation issues (xcrun compiles for Mac only).
-        func pkg(_ sub: String, _ name: String, _ localName: String, weightSize: Int) -> [DownloadFile] {
-            [.init(remotePath: "\(sdpaPrefix)\(sub)/\(name).mlpackage/Manifest.json",
-                   localPath: "\(localName).mlpackage/Manifest.json", estimatedSize: 500),
-             .init(remotePath: "\(sdpaPrefix)\(sub)/\(name).mlpackage/Data/com.apple.CoreML/model.mlmodel",
-                   localPath: "\(localName).mlpackage/Data/com.apple.CoreML/model.mlmodel", estimatedSize: 500_000),
-             .init(remotePath: "\(sdpaPrefix)\(sub)/\(name).mlpackage/Data/com.apple.CoreML/weights/weight.bin",
-                   localPath: "\(localName).mlpackage/Data/com.apple.CoreML/weights/weight.bin", estimatedSize: weightSize)]
+        // Download .mlmodelc files (same format as sdpa/ — verified working on iPhone).
+        func mlc(_ sub: String, _ name: String, _ localName: String, weightSize: Int) -> [DownloadFile] {
+            [.init(remotePath: "\(sdpaPrefix)\(sub)/\(localName).mlmodelc/weights/weight.bin",
+                   localPath: "\(localName).mlmodelc/weights/weight.bin", estimatedSize: weightSize),
+             .init(remotePath: "\(sdpaPrefix)\(sub)/\(localName).mlmodelc/coremldata.bin",
+                   localPath: "\(localName).mlmodelc/coremldata.bin", estimatedSize: 1_000),
+             .init(remotePath: "\(sdpaPrefix)\(sub)/\(localName).mlmodelc/model.mil",
+                   localPath: "\(localName).mlmodelc/model.mil", estimatedSize: 450_000),
+             .init(remotePath: "\(sdpaPrefix)\(sub)/\(localName).mlmodelc/metadata.json",
+                   localPath: "\(localName).mlmodelc/metadata.json", estimatedSize: 8_000),
+             .init(remotePath: "\(sdpaPrefix)\(sub)/\(localName).mlmodelc/analytics/coremldata.bin",
+                   localPath: "\(localName).mlmodelc/analytics/coremldata.bin", estimatedSize: 250)]
         }
-        files = pkg("swa", "chunk1", "chunk1", weightSize: 155_436_864)
-             + pkg("swa", "chunk2", "chunk2", weightSize: 133_963_968)
-             + pkg("swa", "chunk3", "chunk3", weightSize: 325_282_880)
-             + pkg("swa", "chunk4", "chunk4", weightSize: 526_874_880)
-             + pkg("prefill", "prefill_chunk1", "prefill_chunk1", weightSize: 155_436_864)
-             + pkg("prefill", "prefill_chunk2", "prefill_chunk2", weightSize: 133_963_968)
-             + pkg("prefill", "prefill_chunk3", "prefill_chunk3", weightSize: 325_282_880)
-             + pkg("prefill", "prefill_chunk4", "prefill_chunk4", weightSize: 526_874_880)
+        files = mlc("swa", "chunk1", "chunk1", weightSize: 155_436_864)
+             + mlc("swa", "chunk2", "chunk2", weightSize: 133_963_968)
+             + mlc("swa", "chunk3", "chunk3", weightSize: 325_282_880)
+             + mlc("swa", "chunk4", "chunk4", weightSize: 526_874_880)
+             + mlc("prefill", "chunk1", "prefill_chunk1", weightSize: 155_436_864)
+             + mlc("prefill", "chunk2", "prefill_chunk2", weightSize: 133_963_968)
+             + mlc("prefill", "chunk3", "prefill_chunk3", weightSize: 325_282_880)
+             + mlc("prefill", "chunk4", "prefill_chunk4", weightSize: 526_874_880)
         files += [
             .init(remotePath: "\(sdpaPrefix)model_config.json", localPath: "model_config.json", estimatedSize: 1_000),
             // Tokenizer
