@@ -11,6 +11,10 @@ struct ChatView: View {
     @State private var selectedImage: CGImage?
     @State private var selectedImageData: Data?
 
+    // Battery benchmark state
+    @State private var benchmarkRunning = false
+    @State private var benchmarkStatus: String = ""
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
@@ -91,6 +95,15 @@ struct ChatView: View {
                     .padding(.top, 4)
                 }
 
+                if benchmarkRunning || !benchmarkStatus.isEmpty {
+                    Text(benchmarkStatus)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.primary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(Color.orange.opacity(0.15))
+                }
+
                 Divider()
                 inputBar
             }
@@ -113,7 +126,17 @@ struct ChatView: View {
                 if runner.isLoaded {
                     ToolbarItem(placement: .topBarTrailing) {
                         Button("ANE?") { verifyANE() }
-                            .disabled(runner.isGenerating)
+                            .disabled(runner.isGenerating || benchmarkRunning)
+                    }
+                }
+                if runner.isLoaded {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Menu("Bench") {
+                            Button("5 min")  { startBenchmark(minutes: 5) }
+                            Button("10 min") { startBenchmark(minutes: 10) }
+                            Button("30 min") { startBenchmark(minutes: 30) }
+                        }
+                        .disabled(runner.isGenerating || benchmarkRunning)
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
@@ -218,6 +241,67 @@ struct ChatView: View {
                 }
             } catch {
                 messages.append(ChatMessage(role: .system, content: "Error: \(error.localizedDescription)"))
+            }
+        }
+    }
+
+    private func startBenchmark(minutes: Int) {
+        // Warn if plugged in — drain can't be measured accurately while charging.
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        let state = UIDevice.current.batteryState
+        if state == .charging || state == .full {
+            messages.append(ChatMessage(role: .system, content: "[Benchmark] Device is charging — unplug for accurate SoC drain measurement."))
+        }
+
+        benchmarkRunning = true
+        benchmarkStatus = "Benchmark starting… (\(minutes) min)"
+        messages.append(ChatMessage(role: .system, content: "[Benchmark] Starting \(minutes)-minute sustained generation. Unplug, airplane mode recommended. Screen will stay on."))
+
+        // Keep the screen awake during the benchmark so the OS doesn't
+        // auto-lock and park the app in the background.
+        UIApplication.shared.isIdleTimerDisabled = true
+
+        Task {
+            defer { UIApplication.shared.isIdleTimerDisabled = false }
+            do {
+                let result = try await runner.runBenchmark(
+                    duration: TimeInterval(minutes * 60)
+                ) { prog in
+                    let batNow = prog.batteryNow >= 0 ? Int(prog.batteryNow * 100) : -1
+                    let batStart = prog.batteryStart >= 0 ? Int(prog.batteryStart * 100) : -1
+                    benchmarkStatus = String(
+                        format: "[Bench] %ds / round %d  %d tok  avg %.1f tok/s  SoC %d→%d%%  %@",
+                        Int(prog.elapsed),
+                        prog.round,
+                        prog.totalTokens,
+                        prog.avgTokPerSec,
+                        batStart,
+                        batNow,
+                        LLMRunner.thermalString(prog.thermal) as NSString
+                    )
+                }
+
+                benchmarkRunning = false
+                let bs = result.batteryStart >= 0 ? Int(result.batteryStart * 100) : -1
+                let be = result.batteryEnd >= 0 ? Int(result.batteryEnd * 100) : -1
+                let summary = """
+                [Benchmark RESULT]
+                Duration      : \(Int(result.duration))s (\(String(format: "%.1f", result.duration / 60.0)) min)
+                Rounds        : \(result.rounds)
+                Total tokens  : \(result.totalTokens)
+                Avg tok/s     : \(String(format: "%.2f", result.avgTokPerSec))
+                Battery       : \(bs)% → \(be)%  (Δ \(String(format: "%.2f", result.drainedPercent))%)
+                Drain rate    : \(String(format: "%.3f", result.drainedPerMinute))%/min
+                Tokens/%SoC   : \(String(format: "%.0f", result.tokensPerPercent))
+                Thermal       : \(LLMRunner.thermalString(result.thermalStart)) → \(LLMRunner.thermalString(result.thermalEnd))
+                """
+                print(summary)
+                benchmarkStatus = "Benchmark done. See chat for result."
+                messages.append(ChatMessage(role: .system, content: summary))
+            } catch {
+                benchmarkRunning = false
+                benchmarkStatus = ""
+                messages.append(ChatMessage(role: .system, content: "[Benchmark] Failed: \(error.localizedDescription)"))
             }
         }
     }

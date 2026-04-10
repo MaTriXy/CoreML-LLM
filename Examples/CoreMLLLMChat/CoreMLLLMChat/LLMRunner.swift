@@ -2,6 +2,7 @@ import Accelerate
 import CoreML
 import Foundation
 import Tokenizers
+import UIKit
 
 /// Manages CoreML LLM model loading and inference.
 /// Supports monolithic model or chunked model (for large models on iPhone).
@@ -1326,6 +1327,115 @@ final class LLMRunner {
             } else if m.role == .assistant { p += "<|turn>model\n\(m.content)<turn|>\n" }
         }
         return p + "<|turn>model\n"
+    }
+
+    // MARK: - Battery / sustained-throughput benchmark
+    //
+    // Runs continuous generation rounds for a fixed wall-clock duration,
+    // recording:
+    //   - start / end battery SoC (UIDevice.batteryLevel)
+    //   - start / end thermal state (ProcessInfo.thermalState)
+    //   - total tokens produced, average tok/s
+    //
+    // Each round uses a fixed long prompt and resets KV cache, so results
+    // are directly comparable across runs. Caller should put the device
+    // in airplane mode, unplugged, screen on, before starting.
+
+    struct BenchmarkProgress {
+        var elapsed: TimeInterval
+        var totalTokens: Int
+        var round: Int
+        var avgTokPerSec: Double
+        var batteryStart: Float     // 0..1, -1 if unknown
+        var batteryNow: Float
+        var thermal: ProcessInfo.ThermalState
+    }
+
+    struct BenchmarkResult {
+        var duration: TimeInterval
+        var totalTokens: Int
+        var rounds: Int
+        var avgTokPerSec: Double
+        var batteryStart: Float     // 0..1
+        var batteryEnd: Float
+        var thermalStart: ProcessInfo.ThermalState
+        var thermalEnd: ProcessInfo.ThermalState
+
+        var batteryDelta: Float { batteryStart - batteryEnd }  // positive = drained
+        var drainedPercent: Double { Double(batteryDelta) * 100.0 }
+        var drainedPerMinute: Double { duration > 0 ? drainedPercent / (duration / 60.0) : 0 }
+        var tokensPerPercent: Double { drainedPercent > 0 ? Double(totalTokens) / drainedPercent : 0 }
+    }
+
+    /// Fixed prompt that tends to produce long, stable outputs.
+    private static let benchmarkPrompt =
+        "Write a very long, detailed article about the history of artificial intelligence from the 1950s through today. Cover: early symbolic AI and Alan Turing, the first and second AI winters, the rise of neural networks, deep learning breakthroughs like AlexNet and ResNet, the attention mechanism and transformers, the scaling era with GPT-2/3/4, reinforcement learning milestones, and the current era of multimodal foundation models running on-device. Be verbose and thorough."
+
+    @MainActor
+    func runBenchmark(
+        duration: TimeInterval,
+        onProgress: @escaping (BenchmarkProgress) -> Void
+    ) async throws -> BenchmarkResult {
+        // Enable battery monitoring (no-op if already enabled)
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        let startBat = UIDevice.current.batteryLevel
+        let startThermal = ProcessInfo.processInfo.thermalState
+        let startTime = Date()
+
+        var totalTokens = 0
+        var round = 0
+        let prompt = ChatMessage(role: .user, content: Self.benchmarkPrompt)
+
+        while Date().timeIntervalSince(startTime) < duration {
+            round += 1
+            // AsyncStream of decoded chunks — count by fragment, close to
+            // token count (decode() can occasionally emit multi-token chunks
+            // for merged BPE pieces, but for greedy decoding it's ~1:1).
+            let stream = try await generate(messages: [prompt], image: nil)
+            for await _ in stream {
+                totalTokens += 1
+                let elapsed = Date().timeIntervalSince(startTime)
+                if totalTokens % 20 == 0 {
+                    let prog = BenchmarkProgress(
+                        elapsed: elapsed,
+                        totalTokens: totalTokens,
+                        round: round,
+                        avgTokPerSec: elapsed > 0 ? Double(totalTokens) / elapsed : 0,
+                        batteryStart: startBat,
+                        batteryNow: UIDevice.current.batteryLevel,
+                        thermal: ProcessInfo.processInfo.thermalState
+                    )
+                    onProgress(prog)
+                }
+                if elapsed >= duration { break }
+            }
+            if Date().timeIntervalSince(startTime) >= duration { break }
+        }
+
+        let endTime = Date()
+        let endBat = UIDevice.current.batteryLevel
+        let endThermal = ProcessInfo.processInfo.thermalState
+        let dur = endTime.timeIntervalSince(startTime)
+        return BenchmarkResult(
+            duration: dur,
+            totalTokens: totalTokens,
+            rounds: round,
+            avgTokPerSec: dur > 0 ? Double(totalTokens) / dur : 0,
+            batteryStart: startBat,
+            batteryEnd: endBat,
+            thermalStart: startThermal,
+            thermalEnd: endThermal
+        )
+    }
+
+    static func thermalString(_ s: ProcessInfo.ThermalState) -> String {
+        switch s {
+        case .nominal:  return "nominal"
+        case .fair:     return "fair"
+        case .serious:  return "serious"
+        case .critical: return "critical"
+        @unknown default: return "?"
+        }
     }
 
     // MARK: - ANE placement verification
