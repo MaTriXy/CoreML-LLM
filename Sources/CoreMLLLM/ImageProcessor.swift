@@ -3,99 +3,95 @@ import CoreGraphics
 import Foundation
 
 /// Processes images for Gemma 4 multimodal vision encoder.
+///
+/// Matches HuggingFace Gemma3nImageProcessor:
+///   1. Aspect-ratio-preserving resize to max 645,120 pixels (2520 × 16²)
+///   2. Each side rounded down to a multiple of 48 (pooling_kernel × patch_size)
+///   3. Patch extraction: 16×16, channels-last, /255 normalization
+///   4. Meshgrid position IDs (x, y) = (px, py) matching HF indexing="xy"
+///   5. Padding positions marked with -1
 public enum ImageProcessor {
 
     /// Process an image through the vision encoder CoreML model.
     ///
-    /// - Parameters:
-    ///   - image: Input CGImage
-    ///   - visionModel: Compiled vision CoreML model
-    /// - Returns: Image features MLMultiArray (1, 280, hidden_size)
+    /// Returns image features MLMultiArray (1, 280, hidden_size).
     public static func process(_ image: CGImage, with visionModel: MLModel) throws -> MLMultiArray {
-        let (pixelValues, positionIDs) = createPatches(from: image)
+        let ps = 16
+        let total = 2520
+        let pd = ps * ps * 3  // 768 per patch
+
+        // 1. Aspect-ratio-preserving resize (each side multiple of 48).
+        let origH = Double(image.height)
+        let origW = Double(image.width)
+        let targetPx = Double(total * ps * ps)  // 645_120
+        let factor = sqrt(targetPx / (origH * origW))
+        let sideMult = 48
+        var tH = Int(floor(factor * origH / Double(sideMult))) * sideMult
+        var tW = Int(floor(factor * origW / Double(sideMult))) * sideMult
+        if tH < sideMult { tH = sideMult }
+        if tW < sideMult { tW = sideMult }
+        let Hp = tH / ps
+        let Wp = tW / ps
+        let realPatches = Hp * Wp
+
+        // 2. Draw into (tW, tH) RGBA canvas with bicubic interpolation.
+        var pixels = [UInt8](repeating: 0, count: tW * tH * 4)
+        let bitmap = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        let ctx = CGContext(data: &pixels, width: tW, height: tH, bitsPerComponent: 8,
+                            bytesPerRow: tW * 4, space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: bitmap.rawValue)!
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: tW, height: tH))
+
+        // 3. Build pixel_values (1, 2520, 768) fp32 and pixel_position_ids (1, 2520, 2) int32.
+        let pv = try MLMultiArray(shape: [1, NSNumber(value: total), NSNumber(value: pd)],
+                                  dataType: .float32)
+        let pid = try MLMultiArray(shape: [1, NSNumber(value: total), 2], dataType: .int32)
+        let pvp = pv.dataPointer.bindMemory(to: Float.self, capacity: total * pd)
+        let pidp = pid.dataPointer.bindMemory(to: Int32.self, capacity: total * 2)
+        memset(pvp, 0, total * pd * MemoryLayout<Float>.stride)
+
+        var pi = 0
+        for py in 0..<Hp {
+            for px in 0..<Wp {
+                var o = pi * pd
+                for dy in 0..<ps {
+                    for dx in 0..<ps {
+                        let srcIdx = ((py * ps + dy) * tW + (px * ps + dx)) * 4
+                        pvp[o]   = Float(pixels[srcIdx])   / 255
+                        pvp[o+1] = Float(pixels[srcIdx+1]) / 255
+                        pvp[o+2] = Float(pixels[srcIdx+2]) / 255
+                        o += 3
+                    }
+                }
+                pidp[pi * 2]     = Int32(px)
+                pidp[pi * 2 + 1] = Int32(py)
+                pi += 1
+            }
+        }
+        for i in realPatches..<total {
+            pidp[i * 2]     = -1
+            pidp[i * 2 + 1] = -1
+        }
 
         let input = try MLDictionaryFeatureProvider(dictionary: [
-            "pixel_values": MLFeatureValue(multiArray: pixelValues),
-            "pixel_position_ids": MLFeatureValue(multiArray: positionIDs),
+            "pixel_values": MLFeatureValue(multiArray: pv),
+            "pixel_position_ids": MLFeatureValue(multiArray: pid),
         ])
-
-        let output = try visionModel.prediction(from: input)
-        guard let features = output.featureValue(for: "image_features")?.multiArrayValue else {
+        guard let features = try visionModel.prediction(from: input)
+                .featureValue(for: "image_features")?.multiArrayValue else {
             throw CoreMLLLMError.predictionFailed
         }
         return features
     }
 
     /// Extract a single image feature token from the vision output.
-    public static func sliceFeature(_ features: MLMultiArray, at index: Int, hiddenSize: Int) -> MLMultiArray {
-        let result = try! MLMultiArray(shape: [1, 1, NSNumber(value: hiddenSize)], dataType: .float16)
-        let srcPtr = features.dataPointer.bindMemory(to: UInt16.self, capacity: features.count)
-        let dstPtr = result.dataPointer.bindMemory(to: UInt16.self, capacity: hiddenSize)
-        memcpy(dstPtr, srcPtr.advanced(by: index * hiddenSize), hiddenSize * MemoryLayout<UInt16>.stride)
-        return result
-    }
-
-    // MARK: - Private
-
-    private static func createPatches(from image: CGImage) -> (MLMultiArray, MLMultiArray) {
-        let patchSize = 16
-        let totalPatches = 2520
-        let patchDim = 3 * patchSize * patchSize  // 768
-
-        // Resize image to standard grid
-        let targetSize = 896
-        let w = targetSize, h = targetSize
-
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        var pixels = [UInt8](repeating: 0, count: w * h * 4)
-        let context = CGContext(data: &pixels, width: w, height: h,
-                                bitsPerComponent: 8, bytesPerRow: w * 4,
-                                space: colorSpace,
-                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
-        context.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
-
-        let pixelValues = try! MLMultiArray(
-            shape: [1, NSNumber(value: totalPatches), NSNumber(value: patchDim)],
-            dataType: .float32
-        )
-        let positionIDs = try! MLMultiArray(
-            shape: [1, NSNumber(value: totalPatches), 2],
-            dataType: .int32
-        )
-
-        let pvPtr = pixelValues.dataPointer.bindMemory(to: Float.self, capacity: totalPatches * patchDim)
-        let pidPtr = positionIDs.dataPointer.bindMemory(to: Int32.self, capacity: totalPatches * 2)
-
-        let patchesPerSide = w / patchSize
-        var patchIdx = 0
-
-        for py in 0..<patchesPerSide {
-            for px in 0..<patchesPerSide {
-                guard patchIdx < totalPatches else { break }
-                var offset = patchIdx * patchDim
-                for dy in 0..<patchSize {
-                    for dx in 0..<patchSize {
-                        let ix = px * patchSize + dx
-                        let iy = py * patchSize + dy
-                        let pixelOffset = (iy * w + ix) * 4
-                        pvPtr[offset] = Float(pixels[pixelOffset]) / 255.0
-                        pvPtr[offset + 1] = Float(pixels[pixelOffset + 1]) / 255.0
-                        pvPtr[offset + 2] = Float(pixels[pixelOffset + 2]) / 255.0
-                        offset += 3
-                    }
-                }
-                pidPtr[patchIdx * 2] = Int32(px)
-                pidPtr[patchIdx * 2 + 1] = Int32(py)
-                patchIdx += 1
-            }
-        }
-
-        // Padding
-        for i in patchIdx..<totalPatches {
-            pidPtr[i * 2] = -1
-            pidPtr[i * 2 + 1] = -1
-        }
-
-        return (pixelValues, positionIDs)
+    public static func sliceFeature(_ features: MLMultiArray, at index: Int,
+                                     hiddenSize: Int) -> MLMultiArray {
+        let r = try! MLMultiArray(shape: [1, 1, NSNumber(value: hiddenSize)], dataType: .float16)
+        let s = features.dataPointer.bindMemory(to: UInt16.self, capacity: features.count)
+        let d = r.dataPointer.bindMemory(to: UInt16.self, capacity: hiddenSize)
+        memcpy(d, s.advanced(by: index * hiddenSize), hiddenSize * MemoryLayout<UInt16>.stride)
+        return r
     }
 }
