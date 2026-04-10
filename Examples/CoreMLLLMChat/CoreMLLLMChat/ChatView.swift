@@ -148,12 +148,18 @@ struct ChatView: View {
     private func loadModel(from folderURL: URL) {
         let modelURL = folderURL.appendingPathComponent("model.mlpackage")
         messages.append(ChatMessage(role: .system, content: "Loading model..."))
-        Task {
+        // Detached so the synchronous MLModel(contentsOf:) calls inside
+        // loadChunked can't block the main actor / UI thread.
+        Task.detached(priority: .userInitiated) {
             do {
                 try await runner.loadModel(from: modelURL)
-                messages.append(ChatMessage(role: .system, content: "Model loaded! " + (runner.hasVision ? "Image input enabled." : "")))
+                await MainActor.run {
+                    messages.append(ChatMessage(role: .system, content: "Model loaded! " + (runner.hasVision ? "Image input enabled." : "")))
+                }
             } catch {
-                messages.append(ChatMessage(role: .system, content: "Failed: \(error.localizedDescription)"))
+                await MainActor.run {
+                    messages.append(ChatMessage(role: .system, content: "Failed: \(error.localizedDescription)"))
+                }
             }
         }
     }

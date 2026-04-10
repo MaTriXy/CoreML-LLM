@@ -204,35 +204,40 @@ final class LLMRunner {
         //   "MIL->EIR translation: std::bad_cast"
         // Reverting to split layout (separate mlmodelc for decode and prefill)
         // until the multifunction iPhone compile issue is root-caused.
-        loadingStatus = "Loading chunk 1/4..."
-        chunk1 = try MLModel(contentsOf: findModel(in: folder, name: "chunk1")!, configuration: mlConfig)
+        // Load all 4 decode chunks. The first call per chunk on a given
+        // device triggers ANE compilation + caching, which can take 30s-2min.
+        // Print progress so we can see exactly where it hangs if it does.
+        func loadOne(_ name: String, _ progress: String) throws -> MLModel {
+            print("[Load] \(progress) starting: \(name)")
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let url = findModel(in: folder, name: name)!
+            let m = try MLModel(contentsOf: url, configuration: mlConfig)
+            let dt = CFAbsoluteTimeGetCurrent() - t0
+            print("[Load] \(progress) done in \(String(format: "%.1f", dt))s: \(name)")
+            return m
+        }
 
-        loadingStatus = "Loading chunk 2/4..."
-        chunk2 = try MLModel(contentsOf: findModel(in: folder, name: "chunk2")!, configuration: mlConfig)
-
-        loadingStatus = "Loading chunk 3/4..."
-        chunk3 = try MLModel(contentsOf: findModel(in: folder, name: "chunk3")!, configuration: mlConfig)
-
-        loadingStatus = "Loading chunk 4/4..."
-        chunk4 = try MLModel(contentsOf: findModel(in: folder, name: "chunk4")!, configuration: mlConfig)
+        loadingStatus = "Loading decode chunk 1/4 (first run = ANE compile, can take 1-2 min)..."
+        chunk1 = try loadOne("chunk1", "decode 1/4")
+        loadingStatus = "Loading decode chunk 2/4..."
+        chunk2 = try loadOne("chunk2", "decode 2/4")
+        loadingStatus = "Loading decode chunk 3/4..."
+        chunk3 = try loadOne("chunk3", "decode 3/4")
+        loadingStatus = "Loading decode chunk 4/4..."
+        chunk4 = try loadOne("chunk4", "decode 4/4")
 
         // Load prefill chunks as separate files (graceful fallback if missing).
-        if let p1 = findModel(in: folder, name: "prefill_chunk1") {
+        if findModel(in: folder, name: "prefill_chunk1") != nil {
             loadingStatus = "Loading prefill chunk 1/4..."
-            prefillChunk1 = try? MLModel(contentsOf: p1, configuration: mlConfig)
-            if let p2 = findModel(in: folder, name: "prefill_chunk2") {
-                loadingStatus = "Loading prefill chunk 2/4..."
-                prefillChunk2 = try? MLModel(contentsOf: p2, configuration: mlConfig)
-            }
-            if let p3 = findModel(in: folder, name: "prefill_chunk3") {
-                loadingStatus = "Loading prefill chunk 3/4..."
-                prefillChunk3 = try? MLModel(contentsOf: p3, configuration: mlConfig)
-            }
-            if let p4 = findModel(in: folder, name: "prefill_chunk4") {
-                loadingStatus = "Loading prefill chunk 4/4..."
-                prefillChunk4 = try? MLModel(contentsOf: p4, configuration: mlConfig)
-            }
+            prefillChunk1 = try? loadOne("prefill_chunk1", "prefill 1/4")
+            loadingStatus = "Loading prefill chunk 2/4..."
+            prefillChunk2 = try? loadOne("prefill_chunk2", "prefill 2/4")
+            loadingStatus = "Loading prefill chunk 3/4..."
+            prefillChunk3 = try? loadOne("prefill_chunk3", "prefill 3/4")
+            loadingStatus = "Loading prefill chunk 4/4..."
+            prefillChunk4 = try? loadOne("prefill_chunk4", "prefill 4/4")
         }
+        print("[Load] All chunks loaded successfully")
 
         // Allocate persistent SWA KV cache buffers
         loadingStatus = "Allocating KV cache..."
